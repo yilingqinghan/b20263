@@ -1,0 +1,94 @@
+add_llvm_library(LLVMBOLTPasses
+  ADRRelaxationPass.cpp
+  Aligner.cpp
+  AllocCombiner.cpp
+  AsmDump.cpp
+  BinaryPasses.cpp
+  BinaryFunctionCallGraph.cpp
+  BlockEdgeFrequency.cpp
+  CMOVConversion.cpp
+  CacheMetrics.cpp
+  CallGraph.cpp
+  CallGraphWalker.cpp
+  DataflowAnalysis.cpp
+  DataflowInfoManager.cpp
+  FeatureMiner.cpp
+  FrameAnalysis.cpp
+  FrameOptimizer.cpp
+  FixRelaxationPass.cpp
+  FixRISCVCallsPass.cpp
+  HFSort.cpp
+  HFSortPlus.cpp
+  Hugify.cpp
+  IdenticalCodeFolding.cpp
+  IndirectCallPromotion.cpp
+  Inliner.cpp
+  Instrumentation.cpp
+  JTFootprintReduction.cpp
+  LongJmp.cpp
+  LoopInversionPass.cpp
+  LivenessAnalysis.cpp
+  MCF.cpp
+  PatchEntries.cpp
+  PettisAndHansen.cpp
+  PLTCall.cpp
+  RegAnalysis.cpp
+  RegReAssign.cpp
+  ReorderAlgorithm.cpp
+  ReorderFunctions.cpp
+  ReorderData.cpp
+  ShrinkWrapping.cpp
+  SplitFunctions.cpp
+  StackAllocationAnalysis.cpp
+  StackAvailableExpressions.cpp
+  StackPointerTracking.cpp
+  StackReachingUses.cpp
+  StokeInfo.cpp
+  StaticBranchInfo.cpp
+  StaticBranchProbabilities.cpp
+  TailDuplication.cpp
+  ThreeWayBranch.cpp
+  ValidateInternalCalls.cpp
+  ValidateMemRefs.cpp
+  VeneerElimination.cpp
+  RetpolineInsertion.cpp
+  RISCV/RISCVCompressPeephole.cpp
+  RISCV/RISCVConstLUIReuse.cpp
+  RISCV/RISCVGPRelax.cpp
+  RISCV/RISCVStackMemForward.cpp
+  RISCV/RISCVCallSequenceOutliner.cpp
+  RISCV/RISCVTailMerge.cpp
+  RISCV/RISCVReuseLUIAbsolute.cpp
+  RISCV/RISCVReuseLUIAggressive.cpp
+  RISCV/RISCVReuseLUIRelative.cpp
+  RISCV/RISCVElimUnusedFuncs.cpp
+  RISCV/RISCVStackPushOpt.cpp
+  RISCV/RISCVMemorySSA.cpp
+  RISCV/RISCVGVN.cpp
+  RISCV/RISCVSimplifyCFG.cpp
+  RISCV/RISCVAnalyze.cpp
+
+  DISABLE_LLVM_LINK_LLVM_DYLIB
+
+  LINK_LIBS
+  ${LLVM_PTHREAD_LIB}
+
+  LINK_COMPONENTS
+  AsmPrinter
+  MC
+  Support
+  TargetParser
+  TransformUtils
+  )
+
+target_link_libraries(LLVMBOLTPasses
+  PRIVATE
+  LLVMBOLTCore
+  LLVMBOLTUtils
+  )
+
+include_directories(
+  ${LLVM_MAIN_SRC_DIR}/lib/Target/RISCV
+  ${LLVM_INCLUDE_DIRS}
+  ${LLVM_BINARY_DIR}/lib/Target/RISCV
+)

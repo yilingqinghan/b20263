@@ -1,0 +1,4486 @@
+//===- Driver.cpp ---------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// The driver drives the entire linking process. It is responsible for
+// parsing command line options and doing whatever it is instructed to do.
+//
+// One notable thing in the LLD's driver when compared to other linkers is
+// that the LLD's driver is agnostic on the host operating system.
+// Other linkers usually have implicit default values (such as a dynamic
+// linker path or library paths) for each host OS.
+//
+// I don't think implicit default values are useful because they are
+// usually explicitly specified by the compiler ctx.driver. They can even
+// be harmful when you are doing cross-linking. Therefore, in LLD, we
+// simply trust the compiler driver to pass all required options and
+// don't try to make effort on our side.
+//
+//===----------------------------------------------------------------------===//
+
+#include "Driver.h"
+#include "Config.h"
+#include "CSGORFE.h"
+#include "ICF.h"
+#include "InputFiles.h"
+#include "InputSection.h"
+#include "LTO.h"
+#include "LinkerScript.h"
+#include "MarkLive.h"
+#include "OutputSections.h"
+#include "RISCVLZ4Packer.h"
+#include "ScriptParser.h"
+#include "SymbolTable.h"
+#include "Symbols.h"
+#include "SyntheticSections.h"
+#include "Target.h"
+#include "Writer.h"
+#include "lld/Common/Args.h"
+#include "lld/Common/CommonLinkerContext.h"
+#include "lld/Common/Driver.h"
+#include "lld/Common/ErrorHandler.h"
+#include "lld/Common/Filesystem.h"
+#include "lld/Common/Memory.h"
+#include "lld/Common/Strings.h"
+#include "lld/Common/TargetOptionsCommandFlags.h"
+#include "lld/Common/Version.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSwitch.h"
+#include "llvm/Config/llvm-config.h"
+#include "llvm/LTO/LTO.h"
+#include "llvm/Object/Archive.h"
+#include "llvm/Remarks/HotnessThresholdParser.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Compression.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/GlobPattern.h"
+#include "llvm/Support/LEB128.h"
+#include "llvm/Support/Parallel.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/TarWriter.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/TimeProfiler.h"
+#include "llvm/Support/raw_ostream.h"
+#include <cstdlib>
+#include <tuple>
+#include <utility>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <system_error>
+#include <string>
+#include <chrono>
+#include <thread>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include <vector>
+#include <cctype>
+#include <functional> 
+#include <unistd.h>
+#include <iostream>
+#include <cstdio>
+
+
+using namespace llvm;
+using namespace llvm::ELF;
+using namespace llvm::object;
+using namespace llvm::sys;
+using namespace llvm::support;
+using namespace lld;
+using namespace lld::elf;
+
+ConfigWrapper elf::config;
+Ctx elf::ctx;
+
+static void setConfigs(opt::InputArgList &args);
+static void readConfigs(opt::InputArgList &args);
+
+void elf::errorOrWarn(const Twine &msg) {
+  if (config->noinhibitExec)
+    warn(msg);
+  else
+    error(msg);
+}
+
+void Ctx::reset() {
+  driver = LinkerDriver();
+  memoryBuffers.clear();
+  objectFiles.clear();
+  sharedFiles.clear();
+  binaryFiles.clear();
+  bitcodeFiles.clear();
+  lazyBitcodeFiles.clear();
+  inputSections.clear();
+  ehInputSections.clear();
+  duplicates.clear();
+  nonPrevailingSyms.clear();
+  whyExtractRecords.clear();
+  backwardReferences.clear();
+  hasSympart.store(false, std::memory_order_relaxed);
+  needsTlsLd.store(false, std::memory_order_relaxed);
+}
+
+llvm::raw_fd_ostream Ctx::openAuxiliaryFile(llvm::StringRef filename,
+                                            std::error_code &ec) {
+  using namespace llvm::sys::fs;
+  OpenFlags flags =
+      auxiliaryFiles.insert(filename).second ? OF_None : OF_Append;
+  return {filename, ec, flags};
+}
+
+namespace lld {
+namespace elf {
+bool link(ArrayRef<const char *> args, llvm::raw_ostream &stdoutOS,
+          llvm::raw_ostream &stderrOS, bool exitEarly, bool disableOutput) {
+  // This driver-specific context will be freed later by unsafeLldMain().
+  auto *ctx = new CommonLinkerContext;
+
+  ctx->e.initialize(stdoutOS, stderrOS, exitEarly, disableOutput);
+  ctx->e.cleanupCallback = []() {
+    elf::ctx.reset();
+    symtab = SymbolTable();
+
+    outputSections.clear();
+    symAux.clear();
+
+    tar = nullptr;
+    in.reset();
+
+    partitions.clear();
+    partitions.emplace_back();
+
+    SharedFile::vernauxNum = 0;
+  };
+  ctx->e.logName = args::getFilenameWithoutExe(args[0]);
+  ctx->e.errorLimitExceededMsg = "too many errors emitted, stopping now (use "
+                                 "--error-limit=0 to see all errors)";
+
+  config = ConfigWrapper();
+  script = std::make_unique<LinkerScript>();
+
+  symAux.emplace_back();
+
+  partitions.clear();
+  partitions.emplace_back();
+
+  config->progName = args[0];
+
+  elf::ctx.driver.linkerMain(args);
+
+  return errorCount() == 0;
+}
+} // namespace elf
+} // namespace lld
+
+// Parses a linker -m option.
+static std::tuple<ELFKind, uint16_t, uint8_t> parseEmulation(StringRef emul) {
+  uint8_t osabi = 0;
+  StringRef s = emul;
+  if (s.ends_with("_fbsd")) {
+    s = s.drop_back(5);
+    osabi = ELFOSABI_FREEBSD;
+  }
+
+  std::pair<ELFKind, uint16_t> ret =
+      StringSwitch<std::pair<ELFKind, uint16_t>>(s)
+          .Cases("aarch64elf", "aarch64linux", {ELF64LEKind, EM_AARCH64})
+          .Cases("aarch64elfb", "aarch64linuxb", {ELF64BEKind, EM_AARCH64})
+          .Cases("armelf", "armelf_linux_eabi", {ELF32LEKind, EM_ARM})
+          .Cases("armelfb", "armelfb_linux_eabi", {ELF32BEKind, EM_ARM})
+          .Case("elf32_x86_64", {ELF32LEKind, EM_X86_64})
+          .Cases("elf32btsmip", "elf32btsmipn32", {ELF32BEKind, EM_MIPS})
+          .Cases("elf32ltsmip", "elf32ltsmipn32", {ELF32LEKind, EM_MIPS})
+          .Case("elf32lriscv", {ELF32LEKind, EM_RISCV})
+          .Cases("elf32ppc", "elf32ppclinux", {ELF32BEKind, EM_PPC})
+          .Cases("elf32lppc", "elf32lppclinux", {ELF32LEKind, EM_PPC})
+          .Case("elf32loongarch", {ELF32LEKind, EM_LOONGARCH})
+          .Case("elf64btsmip", {ELF64BEKind, EM_MIPS})
+          .Case("elf64ltsmip", {ELF64LEKind, EM_MIPS})
+          .Case("elf64lriscv", {ELF64LEKind, EM_RISCV})
+          .Case("elf64ppc", {ELF64BEKind, EM_PPC64})
+          .Case("elf64lppc", {ELF64LEKind, EM_PPC64})
+          .Cases("elf_amd64", "elf_x86_64", {ELF64LEKind, EM_X86_64})
+          .Case("elf_i386", {ELF32LEKind, EM_386})
+          .Case("elf_iamcu", {ELF32LEKind, EM_IAMCU})
+          .Case("elf64_sparc", {ELF64BEKind, EM_SPARCV9})
+          .Case("msp430elf", {ELF32LEKind, EM_MSP430})
+          .Case("elf64_amdgpu", {ELF64LEKind, EM_AMDGPU})
+          .Case("elf64loongarch", {ELF64LEKind, EM_LOONGARCH})
+          .Default({ELFNoneKind, EM_NONE});
+
+  if (ret.first == ELFNoneKind)
+    error("unknown emulation: " + emul);
+  if (ret.second == EM_MSP430)
+    osabi = ELFOSABI_STANDALONE;
+  else if (ret.second == EM_AMDGPU)
+    osabi = ELFOSABI_AMDGPU_HSA;
+  return std::make_tuple(ret.first, ret.second, osabi);
+}
+
+// Returns slices of MB by parsing MB as an archive file.
+// Each slice consists of a member file in the archive.
+std::vector<std::pair<MemoryBufferRef, uint64_t>> static getArchiveMembers(
+    MemoryBufferRef mb) {
+  std::unique_ptr<Archive> file =
+      CHECK(Archive::create(mb),
+            mb.getBufferIdentifier() + ": failed to parse archive");
+
+  std::vector<std::pair<MemoryBufferRef, uint64_t>> v;
+  Error err = Error::success();
+  bool addToTar = file->isThin() && tar;
+  for (const Archive::Child &c : file->children(err)) {
+    MemoryBufferRef mbref =
+        CHECK(c.getMemoryBufferRef(),
+              mb.getBufferIdentifier() +
+                  ": could not get the buffer for a child of the archive");
+    if (addToTar)
+      tar->append(relativeToRoot(check(c.getFullName())), mbref.getBuffer());
+    v.push_back(std::make_pair(mbref, c.getChildOffset()));
+  }
+  if (err)
+    fatal(mb.getBufferIdentifier() + ": Archive::children failed: " +
+          toString(std::move(err)));
+
+  // Take ownership of memory buffers created for members of thin archives.
+  std::vector<std::unique_ptr<MemoryBuffer>> mbs = file->takeThinBuffers();
+  std::move(mbs.begin(), mbs.end(), std::back_inserter(ctx.memoryBuffers));
+
+  return v;
+}
+
+static bool isBitcode(MemoryBufferRef mb) {
+  return identify_magic(mb.getBuffer()) == llvm::file_magic::bitcode;
+}
+
+// Opens a file and create a file object. Path has to be resolved already.
+void LinkerDriver::addFile(StringRef path, bool withLOption) {
+  using namespace sys::fs;
+
+  std::string rfePath;
+  if (config->csgoRFE && splitRiscv32ObjectFunctions(path, rfePath))
+    path = saver().save(rfePath);
+
+  std::optional<MemoryBufferRef> buffer = readFile(path);
+  if (!buffer)
+    return;
+  MemoryBufferRef mbref = *buffer;
+
+  if (config->formatBinary) {
+    files.push_back(make<BinaryFile>(mbref));
+    return;
+  }
+
+  switch (identify_magic(mbref.getBuffer())) {
+  case file_magic::unknown:
+    readLinkerScript(mbref);
+    return;
+  case file_magic::archive: {
+    auto members = getArchiveMembers(mbref);
+    if (inWholeArchive) {
+      for (const std::pair<MemoryBufferRef, uint64_t> &p : members) {
+        if (isBitcode(p.first))
+          files.push_back(make<BitcodeFile>(p.first, path, p.second, false));
+        else
+          files.push_back(createObjFile(p.first, path));
+      }
+      return;
+    }
+
+    archiveFiles.emplace_back(path, members.size());
+
+    // Handle archives and --start-lib/--end-lib using the same code path. This
+    // scans all the ELF relocatable object files and bitcode files in the
+    // archive rather than just the index file, with the benefit that the
+    // symbols are only loaded once. For many projects archives see high
+    // utilization rates and it is a net performance win. --start-lib scans
+    // symbols in the same order that llvm-ar adds them to the index, so in the
+    // common case the semantics are identical. If the archive symbol table was
+    // created in a different order, or is incomplete, this strategy has
+    // different semantics. Such output differences are considered user error.
+    //
+    // All files within the archive get the same group ID to allow mutual
+    // references for --warn-backrefs.
+    bool saved = InputFile::isInGroup;
+    InputFile::isInGroup = true;
+    for (const std::pair<MemoryBufferRef, uint64_t> &p : members) {
+      auto magic = identify_magic(p.first.getBuffer());
+      if (magic == file_magic::elf_relocatable)
+        files.push_back(createObjFile(p.first, path, true));
+      else if (magic == file_magic::bitcode)
+        files.push_back(make<BitcodeFile>(p.first, path, p.second, true));
+      else
+        warn(path + ": archive member '" + p.first.getBufferIdentifier() +
+             "' is neither ET_REL nor LLVM bitcode");
+    }
+    InputFile::isInGroup = saved;
+    if (!saved)
+      ++InputFile::nextGroupId;
+    return;
+  }
+  case file_magic::elf_shared_object: {
+    if (config->isStatic || config->relocatable) {
+      error("attempted static link of dynamic object " + path);
+      return;
+    }
+
+    // Shared objects are identified by soname. soname is (if specified)
+    // DT_SONAME and falls back to filename. If a file was specified by -lfoo,
+    // the directory part is ignored. Note that path may be a temporary and
+    // cannot be stored into SharedFile::soName.
+    path = mbref.getBufferIdentifier();
+    auto *f =
+        make<SharedFile>(mbref, withLOption ? path::filename(path) : path);
+    f->init();
+    files.push_back(f);
+    return;
+  }
+  case file_magic::bitcode:
+    files.push_back(make<BitcodeFile>(mbref, "", 0, inLib));
+    break;
+  case file_magic::elf_relocatable:
+    files.push_back(createObjFile(mbref, "", inLib));
+    break;
+  default:
+    error(path + ": unknown file type");
+  }
+}
+
+// Add a given library by searching it from input search paths.
+void LinkerDriver::addLibrary(StringRef name) {
+  if (std::optional<std::string> path = searchLibrary(name))
+    addFile(saver().save(*path), /*withLOption=*/true);
+  else
+    error("unable to find library -l" + name, ErrorTag::LibNotFound, {name});
+}
+
+// This function is called on startup. We need this for LTO since
+// LTO calls LLVM functions to compile bitcode files to native code.
+// Technically this can be delayed until we read bitcode files, but
+// we don't bother to do lazily because the initialization is fast.
+static void initLLVM() {
+#if defined(ENABLE_AUTOTUNER)
+  // AUTO-TUNING - initialization
+  if (Error E = autotuning::Engine.init(config->outputFile.data())) {
+    error(toString(std::move(E)));
+    return;
+  }
+  if (autotuning::Engine.isEnabled() && autotuning::Engine.isParseInput() &&
+      (autotuning::Engine.LLVMParams.size() ||
+       autotuning::Engine.ProgramParams.size()))
+    llvm::cl::ParseAutoTunerOptions(autotuning::Engine.LLVMParams,
+                                    autotuning::Engine.ProgramParams);
+#endif
+  InitializeAllTargets();
+  InitializeAllTargetMCs();
+  InitializeAllAsmPrinters();
+  InitializeAllAsmParsers();
+}
+
+// Some command line options or some combinations of them are not allowed.
+// This function checks for such errors.
+static void checkOptions() {
+  // The MIPS ABI as of 2016 does not support the GNU-style symbol lookup
+  // table which is a relatively new feature.
+  if (config->emachine == EM_MIPS && config->gnuHash)
+    error("the .gnu.hash section is not compatible with the MIPS target");
+
+  if (config->emachine == EM_ARM) {
+    if (!config->cmseImplib) {
+      if (!config->cmseInputLib.empty())
+        error("--in-implib may not be used without --cmse-implib");
+      if (!config->cmseOutputLib.empty())
+        error("--out-implib may not be used without --cmse-implib");
+    }
+  } else {
+    if (config->cmseImplib)
+      error("--cmse-implib is only supported on ARM targets");
+    if (!config->cmseInputLib.empty())
+      error("--in-implib is only supported on ARM targets");
+    if (!config->cmseOutputLib.empty())
+      error("--out-implib is only supported on ARM targets");
+  }
+
+  if (config->fixCortexA53Errata843419 && config->emachine != EM_AARCH64)
+    error("--fix-cortex-a53-843419 is only supported on AArch64 targets");
+
+  if (config->fixCortexA8 && config->emachine != EM_ARM)
+    error("--fix-cortex-a8 is only supported on ARM targets");
+
+  if (config->armBe8 && config->emachine != EM_ARM)
+    error("--be8 is only supported on ARM targets");
+
+  if (config->fixCortexA8 && !config->isLE)
+    error("--fix-cortex-a8 is not supported on big endian targets");
+
+  if (config->tocOptimize && config->emachine != EM_PPC64)
+    error("--toc-optimize is only supported on PowerPC64 targets");
+
+  if (config->pcRelOptimize && config->emachine != EM_PPC64)
+    error("--pcrel-optimize is only supported on PowerPC64 targets");
+
+  if (config->relaxGP && config->emachine != EM_RISCV)
+    error("--relax-gp is only supported on RISC-V targets");
+
+  if (config->pie && config->shared)
+    error("-shared and -pie may not be used together");
+
+  if (!config->shared && !config->filterList.empty())
+    error("-F may not be used without -shared");
+
+  if (!config->shared && !config->auxiliaryList.empty())
+    error("-f may not be used without -shared");
+
+  if (config->strip == StripPolicy::All && config->emitRelocs)
+    error("--strip-all and --emit-relocs may not be used together");
+
+  if (config->zText && config->zIfuncNoplt)
+    error("-z text and -z ifunc-noplt may not be used together");
+
+  if (config->relocatable) {
+    if (config->shared)
+      error("-r and -shared may not be used together");
+    if (config->gdbIndex)
+      error("-r and --gdb-index may not be used together");
+    if (config->icf != ICFLevel::None)
+      error("-r and --icf may not be used together");
+    if (config->pie)
+      error("-r and -pie may not be used together");
+    if (config->exportDynamic)
+      error("-r and --export-dynamic may not be used together");
+  }
+
+  if (config->executeOnly) {
+    if (config->emachine != EM_AARCH64)
+      error("--execute-only is only supported on AArch64 targets");
+
+    if (config->singleRoRx && !script->hasSectionsCommand)
+      error("--execute-only and --no-rosegment cannot be used together");
+  }
+
+  if (config->zRetpolineplt && config->zForceIbt)
+    error("-z force-ibt may not be used with -z retpolineplt");
+
+  if (config->emachine != EM_AARCH64) {
+    if (config->zPacPlt)
+      error("-z pac-plt only supported on AArch64");
+    if (config->zForceBti)
+      error("-z force-bti only supported on AArch64");
+    if (config->zBtiReport != "none")
+      error("-z bti-report only supported on AArch64");
+  }
+
+  if (config->emachine != EM_386 && config->emachine != EM_X86_64 &&
+      config->zCetReport != "none")
+    error("-z cet-report only supported on X86 and X86_64");
+}
+
+static const char *getReproduceOption(opt::InputArgList &args) {
+  if (auto *arg = args.getLastArg(OPT_reproduce))
+    return arg->getValue();
+  return getenv("LLD_REPRODUCE");
+}
+
+static bool hasZOption(opt::InputArgList &args, StringRef key) {
+  for (auto *arg : args.filtered(OPT_z))
+    if (key == arg->getValue())
+      return true;
+  return false;
+}
+
+static bool getZFlag(opt::InputArgList &args, StringRef k1, StringRef k2,
+                     bool Default) {
+  for (auto *arg : args.filtered_reverse(OPT_z)) {
+    if (k1 == arg->getValue())
+      return true;
+    if (k2 == arg->getValue())
+      return false;
+  }
+  return Default;
+}
+
+static SeparateSegmentKind getZSeparate(opt::InputArgList &args) {
+  for (auto *arg : args.filtered_reverse(OPT_z)) {
+    StringRef v = arg->getValue();
+    if (v == "noseparate-code")
+      return SeparateSegmentKind::None;
+    if (v == "separate-code")
+      return SeparateSegmentKind::Code;
+    if (v == "separate-loadable-segments")
+      return SeparateSegmentKind::Loadable;
+  }
+  return SeparateSegmentKind::None;
+}
+
+static GnuStackKind getZGnuStack(opt::InputArgList &args) {
+  for (auto *arg : args.filtered_reverse(OPT_z)) {
+    if (StringRef("execstack") == arg->getValue())
+      return GnuStackKind::Exec;
+    if (StringRef("noexecstack") == arg->getValue())
+      return GnuStackKind::NoExec;
+    if (StringRef("nognustack") == arg->getValue())
+      return GnuStackKind::None;
+  }
+  return GnuStackKind::NoExec;
+}
+
+static uint8_t getZStartStopVisibility(opt::InputArgList &args) {
+  for (auto *arg : args.filtered_reverse(OPT_z)) {
+    std::pair<StringRef, StringRef> kv = StringRef(arg->getValue()).split('=');
+    if (kv.first == "start-stop-visibility") {
+      if (kv.second == "default")
+        return STV_DEFAULT;
+      else if (kv.second == "internal")
+        return STV_INTERNAL;
+      else if (kv.second == "hidden")
+        return STV_HIDDEN;
+      else if (kv.second == "protected")
+        return STV_PROTECTED;
+      error("unknown -z start-stop-visibility= value: " + StringRef(kv.second));
+    }
+  }
+  return STV_PROTECTED;
+}
+
+constexpr const char *knownZFlags[] = {
+    "combreloc",
+    "copyreloc",
+    "defs",
+    "execstack",
+    "force-bti",
+    "force-ibt",
+    "global",
+    "hazardplt",
+    "ifunc-noplt",
+    "initfirst",
+    "interpose",
+    "keep-text-section-prefix",
+    "lazy",
+    "muldefs",
+    "nocombreloc",
+    "nocopyreloc",
+    "nodefaultlib",
+    "nodelete",
+    "nodlopen",
+    "noexecstack",
+    "nognustack",
+    "nokeep-text-section-prefix",
+    "nopack-relative-relocs",
+    "norelro",
+    "noseparate-code",
+    "nostart-stop-gc",
+    "notext",
+    "now",
+    "origin",
+    "pac-plt",
+    "pack-relative-relocs",
+    "rel",
+    "rela",
+    "relro",
+    "retpolineplt",
+    "rodynamic",
+    "separate-code",
+    "separate-loadable-segments",
+    "shstk",
+    "start-stop-gc",
+    "text",
+    "undefs",
+    "wxneeded",
+};
+
+static bool isKnownZFlag(StringRef s) {
+  return llvm::is_contained(knownZFlags, s) ||
+         s.starts_with("common-page-size=") || s.starts_with("bti-report=") ||
+         s.starts_with("cet-report=") ||
+         s.starts_with("dead-reloc-in-nonalloc=") ||
+         s.starts_with("max-page-size=") || s.starts_with("stack-size=") ||
+         s.starts_with("start-stop-visibility=");
+}
+
+// Report a warning for an unknown -z option.
+static void checkZOptions(opt::InputArgList &args) {
+  for (auto *arg : args.filtered(OPT_z))
+    if (!isKnownZFlag(arg->getValue()))
+      warn("unknown -z value: " + StringRef(arg->getValue()));
+}
+
+constexpr const char *saveTempsValues[] = {
+    "resolution", "preopt",     "promote", "internalize",  "import",
+    "opt",        "precodegen", "prelink", "combinedindex"};
+
+void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
+  ELFOptTable parser;
+  opt::InputArgList args = parser.parse(argsArr.slice(1));
+
+  // Interpret these flags early because error()/warn() depend on them.
+  errorHandler().errorLimit = args::getInteger(args, OPT_error_limit, 20);
+  errorHandler().fatalWarnings =
+      args.hasFlag(OPT_fatal_warnings, OPT_no_fatal_warnings, false) &&
+      !args.hasArg(OPT_no_warnings);
+  errorHandler().suppressWarnings = args.hasArg(OPT_no_warnings);
+  checkZOptions(args);
+
+  // Handle -help
+  if (args.hasArg(OPT_help)) {
+    printHelp();
+    return;
+  }
+
+  // Handle -v or -version.
+  //
+  // A note about "compatible with GNU linkers" message: this is a hack for
+  // scripts generated by GNU Libtool up to 2021-10 to recognize LLD as
+  // a GNU compatible linker. See
+  // <https://lists.gnu.org/archive/html/libtool/2017-01/msg00007.html>.
+  //
+  // This is somewhat ugly hack, but in reality, we had no choice other
+  // than doing this. Considering the very long release cycle of Libtool,
+  // it is not easy to improve it to recognize LLD as a GNU compatible
+  // linker in a timely manner. Even if we can make it, there are still a
+  // lot of "configure" scripts out there that are generated by old version
+  // of Libtool. We cannot convince every software developer to migrate to
+  // the latest version and re-generate scripts. So we have this hack.
+  if (args.hasArg(OPT_v) || args.hasArg(OPT_version))
+    message(getLLDVersion() + " (compatible with GNU linkers)");
+
+  if (const char *path = getReproduceOption(args)) {
+    // Note that --reproduce is a debug option so you can ignore it
+    // if you are trying to understand the whole picture of the code.
+    Expected<std::unique_ptr<TarWriter>> errOrWriter =
+        TarWriter::create(path, path::stem(path));
+    if (errOrWriter) {
+      tar = std::move(*errOrWriter);
+      tar->append("response.txt", createResponseFile(args));
+      tar->append("version.txt", getLLDVersion() + "\n");
+      StringRef ltoSampleProfile = args.getLastArgValue(OPT_lto_sample_profile);
+      if (!ltoSampleProfile.empty())
+        readFile(ltoSampleProfile);
+    } else {
+      error("--reproduce: " + toString(errOrWriter.takeError()));
+    }
+  }
+
+  readConfigs(args);
+
+  // The behavior of -v or --version is a bit strange, but this is
+  // needed for compatibility with GNU linkers.
+  if (args.hasArg(OPT_v) && !args.hasArg(OPT_INPUT))
+    return;
+  if (args.hasArg(OPT_version))
+    return;
+
+  // Initialize time trace profiler.
+  if (config->timeTraceEnabled)
+    timeTraceProfilerInitialize(config->timeTraceGranularity, config->progName);
+
+  {
+    llvm::TimeTraceScope timeScope("ExecuteLinker");
+
+    initLLVM();
+    createFiles(args);
+    if (errorCount())
+      return;
+
+    inferMachineType();
+    setConfigs(args);
+    checkOptions();
+    if (errorCount())
+      return;
+
+    link(args);
+  }
+
+  if (config->timeTraceEnabled) {
+    checkError(timeTraceProfilerWrite(
+        args.getLastArgValue(OPT_time_trace_eq).str(), config->outputFile));
+    timeTraceProfilerCleanup();
+  }
+}
+
+static std::string getRpath(opt::InputArgList &args) {
+  SmallVector<StringRef, 0> v = args::getStrings(args, OPT_rpath);
+  return llvm::join(v.begin(), v.end(), ":");
+}
+
+// Determines what we should do if there are remaining unresolved
+// symbols after the name resolution.
+static void setUnresolvedSymbolPolicy(opt::InputArgList &args) {
+  UnresolvedPolicy errorOrWarn = args.hasFlag(OPT_error_unresolved_symbols,
+                                              OPT_warn_unresolved_symbols, true)
+                                     ? UnresolvedPolicy::ReportError
+                                     : UnresolvedPolicy::Warn;
+  // -shared implies --unresolved-symbols=ignore-all because missing
+  // symbols are likely to be resolved at runtime.
+  bool diagRegular = !config->shared, diagShlib = !config->shared;
+
+  for (const opt::Arg *arg : args) {
+    switch (arg->getOption().getID()) {
+    case OPT_unresolved_symbols: {
+      StringRef s = arg->getValue();
+      if (s == "ignore-all") {
+        diagRegular = false;
+        diagShlib = false;
+      } else if (s == "ignore-in-object-files") {
+        diagRegular = false;
+        diagShlib = true;
+      } else if (s == "ignore-in-shared-libs") {
+        diagRegular = true;
+        diagShlib = false;
+      } else if (s == "report-all") {
+        diagRegular = true;
+        diagShlib = true;
+      } else {
+        error("unknown --unresolved-symbols value: " + s);
+      }
+      break;
+    }
+    case OPT_no_undefined:
+      diagRegular = true;
+      break;
+    case OPT_z:
+      if (StringRef(arg->getValue()) == "defs")
+        diagRegular = true;
+      else if (StringRef(arg->getValue()) == "undefs")
+        diagRegular = false;
+      break;
+    case OPT_allow_shlib_undefined:
+      diagShlib = false;
+      break;
+    case OPT_no_allow_shlib_undefined:
+      diagShlib = true;
+      break;
+    }
+  }
+
+  config->unresolvedSymbols =
+      diagRegular ? errorOrWarn : UnresolvedPolicy::Ignore;
+  config->unresolvedSymbolsInShlib =
+      diagShlib ? errorOrWarn : UnresolvedPolicy::Ignore;
+}
+
+static Target2Policy getTarget2(opt::InputArgList &args) {
+  StringRef s = args.getLastArgValue(OPT_target2, "got-rel");
+  if (s == "rel")
+    return Target2Policy::Rel;
+  if (s == "abs")
+    return Target2Policy::Abs;
+  if (s == "got-rel")
+    return Target2Policy::GotRel;
+  error("unknown --target2 option: " + s);
+  return Target2Policy::GotRel;
+}
+
+static bool isOutputFormatBinary(opt::InputArgList &args) {
+  StringRef s = args.getLastArgValue(OPT_oformat, "elf");
+  if (s == "binary")
+    return true;
+  if (!s.starts_with("elf"))
+    error("unknown --oformat value: " + s);
+  return false;
+}
+
+static DiscardPolicy getDiscard(opt::InputArgList &args) {
+  auto *arg =
+      args.getLastArg(OPT_discard_all, OPT_discard_locals, OPT_discard_none);
+  if (!arg)
+    return DiscardPolicy::Default;
+  if (arg->getOption().getID() == OPT_discard_all)
+    return DiscardPolicy::All;
+  if (arg->getOption().getID() == OPT_discard_locals)
+    return DiscardPolicy::Locals;
+  return DiscardPolicy::None;
+}
+
+static StringRef getDynamicLinker(opt::InputArgList &args) {
+  auto *arg = args.getLastArg(OPT_dynamic_linker, OPT_no_dynamic_linker);
+  if (!arg)
+    return "";
+  if (arg->getOption().getID() == OPT_no_dynamic_linker) {
+    // --no-dynamic-linker suppresses undefined weak symbols in .dynsym
+    config->noDynamicLinker = true;
+    return "";
+  }
+  return arg->getValue();
+}
+
+static int getMemtagMode(opt::InputArgList &args) {
+  StringRef memtagModeArg = args.getLastArgValue(OPT_android_memtag_mode);
+  if (memtagModeArg.empty()) {
+    if (config->androidMemtagStack)
+      warn("--android-memtag-mode is unspecified, leaving "
+           "--android-memtag-stack a no-op");
+    else if (config->androidMemtagHeap)
+      warn("--android-memtag-mode is unspecified, leaving "
+           "--android-memtag-heap a no-op");
+    return ELF::NT_MEMTAG_LEVEL_NONE;
+  }
+
+  if (!config->androidMemtagHeap && !config->androidMemtagStack) {
+    error("when using --android-memtag-mode, at least one of "
+          "--android-memtag-heap or "
+          "--android-memtag-stack is required");
+    return ELF::NT_MEMTAG_LEVEL_NONE;
+  }
+
+  if (memtagModeArg == "sync")
+    return ELF::NT_MEMTAG_LEVEL_SYNC;
+  if (memtagModeArg == "async")
+    return ELF::NT_MEMTAG_LEVEL_ASYNC;
+  if (memtagModeArg == "none")
+    return ELF::NT_MEMTAG_LEVEL_NONE;
+
+  error("unknown --android-memtag-mode value: \"" + memtagModeArg +
+        "\", should be one of {async, sync, none}");
+  return ELF::NT_MEMTAG_LEVEL_NONE;
+}
+
+static ICFLevel getICF(opt::InputArgList &args) {
+  auto *arg = args.getLastArg(OPT_icf_none, OPT_icf_safe, OPT_icf_all);
+  if (!arg || arg->getOption().getID() == OPT_icf_none)
+    return ICFLevel::None;
+  if (arg->getOption().getID() == OPT_icf_safe)
+    return ICFLevel::Safe;
+  return ICFLevel::All;
+}
+
+static StripPolicy getStrip(opt::InputArgList &args) {
+  if (args.hasArg(OPT_relocatable))
+    return StripPolicy::None;
+
+  auto *arg = args.getLastArg(OPT_strip_all, OPT_strip_debug);
+  if (!arg)
+    return StripPolicy::None;
+  if (arg->getOption().getID() == OPT_strip_all)
+    return StripPolicy::All;
+  return StripPolicy::Debug;
+}
+
+static uint64_t parseSectionAddress(StringRef s, opt::InputArgList &args,
+                                    const opt::Arg &arg) {
+  uint64_t va = 0;
+  if (s.starts_with("0x"))
+    s = s.drop_front(2);
+  if (!to_integer(s, va, 16))
+    error("invalid argument: " + arg.getAsString(args));
+  return va;
+}
+
+static StringMap<uint64_t> getSectionStartMap(opt::InputArgList &args) {
+  StringMap<uint64_t> ret;
+  for (auto *arg : args.filtered(OPT_section_start)) {
+    StringRef name;
+    StringRef addr;
+    std::tie(name, addr) = StringRef(arg->getValue()).split('=');
+    ret[name] = parseSectionAddress(addr, args, *arg);
+  }
+
+  if (auto *arg = args.getLastArg(OPT_Ttext))
+    ret[".text"] = parseSectionAddress(arg->getValue(), args, *arg);
+  if (auto *arg = args.getLastArg(OPT_Tdata))
+    ret[".data"] = parseSectionAddress(arg->getValue(), args, *arg);
+  if (auto *arg = args.getLastArg(OPT_Tbss))
+    ret[".bss"] = parseSectionAddress(arg->getValue(), args, *arg);
+  return ret;
+}
+
+static SortSectionPolicy getSortSection(opt::InputArgList &args) {
+  StringRef s = args.getLastArgValue(OPT_sort_section);
+  if (s == "alignment")
+    return SortSectionPolicy::Alignment;
+  if (s == "name")
+    return SortSectionPolicy::Name;
+  if (!s.empty())
+    error("unknown --sort-section rule: " + s);
+  return SortSectionPolicy::Default;
+}
+
+static OrphanHandlingPolicy getOrphanHandling(opt::InputArgList &args) {
+  StringRef s = args.getLastArgValue(OPT_orphan_handling, "place");
+  if (s == "warn")
+    return OrphanHandlingPolicy::Warn;
+  if (s == "error")
+    return OrphanHandlingPolicy::Error;
+  if (s != "place")
+    error("unknown --orphan-handling mode: " + s);
+  return OrphanHandlingPolicy::Place;
+}
+
+// Parse --build-id or --build-id=<style>. We handle "tree" as a
+// synonym for "sha1" because all our hash functions including
+// --build-id=sha1 are actually tree hashes for performance reasons.
+static std::pair<BuildIdKind, SmallVector<uint8_t, 0>>
+getBuildId(opt::InputArgList &args) {
+  return {BuildIdKind::Fast, {}};
+  auto *arg = args.getLastArg(OPT_build_id);
+  if (!arg)
+    return {BuildIdKind::None, {}};
+
+  StringRef s = arg->getValue();
+  if (s == "fast")
+    return {BuildIdKind::Fast, {}};
+  if (s == "md5")
+    return {BuildIdKind::Md5, {}};
+  if (s == "sha1" || s == "tree")
+    return {BuildIdKind::Sha1, {}};
+  if (s == "uuid")
+    return {BuildIdKind::Uuid, {}};
+  if (s.starts_with("0x"))
+    return {BuildIdKind::Hexstring, parseHex(s.substr(2))};
+
+  if (s != "none")
+    error("unknown --build-id style: " + s);
+  return {BuildIdKind::None, {}};
+}
+
+static std::pair<bool, bool> getPackDynRelocs(opt::InputArgList &args) {
+  StringRef s = args.getLastArgValue(OPT_pack_dyn_relocs, "none");
+  if (s == "android")
+    return {true, false};
+  if (s == "relr")
+    return {false, true};
+  if (s == "android+relr")
+    return {true, true};
+
+  if (s != "none")
+    error("unknown --pack-dyn-relocs format: " + s);
+  return {false, false};
+}
+
+static void readCallGraph(MemoryBufferRef mb) {
+  // Build a map from symbol name to section
+  DenseMap<StringRef, Symbol *> map;
+  for (ELFFileBase *file : ctx.objectFiles)
+    for (Symbol *sym : file->getSymbols())
+      map[sym->getName()] = sym;
+
+  auto findSection = [&](StringRef name) -> InputSectionBase * {
+    Symbol *sym = map.lookup(name);
+    if (!sym) {
+      if (config->warnSymbolOrdering)
+        warn(mb.getBufferIdentifier() + ": no such symbol: " + name);
+      return nullptr;
+    }
+    maybeWarnUnorderableSymbol(sym);
+
+    if (Defined *dr = dyn_cast_or_null<Defined>(sym))
+      return dyn_cast_or_null<InputSectionBase>(dr->section);
+    return nullptr;
+  };
+
+  for (StringRef line : args::getLines(mb)) {
+    SmallVector<StringRef, 3> fields;
+    line.split(fields, ' ');
+    uint64_t count;
+
+    if (fields.size() != 3 || !to_integer(fields[2], count)) {
+      error(mb.getBufferIdentifier() + ": parse error");
+      return;
+    }
+
+    if (InputSectionBase *from = findSection(fields[0]))
+      if (InputSectionBase *to = findSection(fields[1]))
+        config->callGraphProfile[std::make_pair(from, to)] += count;
+  }
+}
+
+// If SHT_LLVM_CALL_GRAPH_PROFILE and its relocation section exist, returns
+// true and populates cgProfile and symbolIndices.
+template <class ELFT>
+static bool
+processCallGraphRelocations(SmallVector<uint32_t, 32> &symbolIndices,
+                            ArrayRef<typename ELFT::CGProfile> &cgProfile,
+                            ObjFile<ELFT> *inputObj) {
+  if (inputObj->cgProfileSectionIndex == SHN_UNDEF)
+    return false;
+
+  ArrayRef<Elf_Shdr_Impl<ELFT>> objSections =
+      inputObj->template getELFShdrs<ELFT>();
+  symbolIndices.clear();
+  const ELFFile<ELFT> &obj = inputObj->getObj();
+  cgProfile =
+      check(obj.template getSectionContentsAsArray<typename ELFT::CGProfile>(
+          objSections[inputObj->cgProfileSectionIndex]));
+
+  for (size_t i = 0, e = objSections.size(); i < e; ++i) {
+    const Elf_Shdr_Impl<ELFT> &sec = objSections[i];
+    if (sec.sh_info == inputObj->cgProfileSectionIndex) {
+      if (sec.sh_type == SHT_RELA) {
+        ArrayRef<typename ELFT::Rela> relas =
+            CHECK(obj.relas(sec), "could not retrieve cg profile rela section");
+        for (const typename ELFT::Rela &rel : relas)
+          symbolIndices.push_back(rel.getSymbol(config->isMips64EL));
+        break;
+      }
+      if (sec.sh_type == SHT_REL) {
+        ArrayRef<typename ELFT::Rel> rels =
+            CHECK(obj.rels(sec), "could not retrieve cg profile rel section");
+        for (const typename ELFT::Rel &rel : rels)
+          symbolIndices.push_back(rel.getSymbol(config->isMips64EL));
+        break;
+      }
+    }
+  }
+  if (symbolIndices.empty())
+    warn("SHT_LLVM_CALL_GRAPH_PROFILE exists, but relocation section doesn't");
+  return !symbolIndices.empty();
+}
+
+template <class ELFT> static void readCallGraphsFromObjectFiles() {
+  SmallVector<uint32_t, 32> symbolIndices;
+  ArrayRef<typename ELFT::CGProfile> cgProfile;
+  for (auto file : ctx.objectFiles) {
+    auto *obj = cast<ObjFile<ELFT>>(file);
+    if (!processCallGraphRelocations(symbolIndices, cgProfile, obj))
+      continue;
+
+    if (symbolIndices.size() != cgProfile.size() * 2)
+      fatal("number of relocations doesn't match Weights");
+
+    for (uint32_t i = 0, size = cgProfile.size(); i < size; ++i) {
+      const Elf_CGProfile_Impl<ELFT> &cgpe = cgProfile[i];
+      uint32_t fromIndex = symbolIndices[i * 2];
+      uint32_t toIndex = symbolIndices[i * 2 + 1];
+      auto *fromSym = dyn_cast<Defined>(&obj->getSymbol(fromIndex));
+      auto *toSym = dyn_cast<Defined>(&obj->getSymbol(toIndex));
+      if (!fromSym || !toSym)
+        continue;
+
+      auto *from = dyn_cast_or_null<InputSectionBase>(fromSym->section);
+      auto *to = dyn_cast_or_null<InputSectionBase>(toSym->section);
+      if (from && to)
+        config->callGraphProfile[{from, to}] += cgpe.cgp_weight;
+    }
+  }
+}
+
+static DebugCompressionType getCompressionType(StringRef s, StringRef option) {
+  DebugCompressionType type = StringSwitch<DebugCompressionType>(s)
+                                  .Case("zlib", DebugCompressionType::Zlib)
+                                  .Case("zstd", DebugCompressionType::Zstd)
+                                  .Default(DebugCompressionType::None);
+  if (type == DebugCompressionType::None) {
+    if (s != "none")
+      error("unknown " + option + " value: " + s);
+  } else if (const char *reason = compression::getReasonIfUnsupported(
+                 compression::formatFor(type))) {
+    error(option + ": " + reason);
+  }
+  return type;
+}
+
+static StringRef getAliasSpelling(opt::Arg *arg) {
+  if (const opt::Arg *alias = arg->getAlias())
+    return alias->getSpelling();
+  return arg->getSpelling();
+}
+
+static std::pair<StringRef, StringRef> getOldNewOptions(opt::InputArgList &args,
+                                                        unsigned id) {
+  auto *arg = args.getLastArg(id);
+  if (!arg)
+    return {"", ""};
+
+  StringRef s = arg->getValue();
+  std::pair<StringRef, StringRef> ret = s.split(';');
+  if (ret.second.empty())
+    error(getAliasSpelling(arg) + " expects 'old;new' format, but got " + s);
+  return ret;
+}
+
+// Parse options of the form "old;new[;extra]".
+static std::tuple<StringRef, StringRef, StringRef>
+getOldNewOptionsExtra(opt::InputArgList &args, unsigned id) {
+  auto [oldDir, second] = getOldNewOptions(args, id);
+  auto [newDir, extraDir] = second.split(';');
+  return {oldDir, newDir, extraDir};
+}
+
+// Parse the symbol ordering file and warn for any duplicate entries.
+static SmallVector<StringRef, 0> getSymbolOrderingFile(MemoryBufferRef mb) {
+  SetVector<StringRef, SmallVector<StringRef, 0>> names;
+  for (StringRef s : args::getLines(mb))
+    if (!names.insert(s) && config->warnSymbolOrdering)
+      warn(mb.getBufferIdentifier() + ": duplicate ordered symbol: " + s);
+
+  return names.takeVector();
+}
+
+static bool getIsRela(opt::InputArgList &args) {
+  // If -z rel or -z rela is specified, use the last option.
+  for (auto *arg : args.filtered_reverse(OPT_z)) {
+    StringRef s(arg->getValue());
+    if (s == "rel")
+      return false;
+    if (s == "rela")
+      return true;
+  }
+
+  // Otherwise use the psABI defined relocation entry format.
+  uint16_t m = config->emachine;
+  return m == EM_AARCH64 || m == EM_AMDGPU || m == EM_HEXAGON ||
+         m == EM_LOONGARCH || m == EM_PPC || m == EM_PPC64 || m == EM_RISCV ||
+         m == EM_X86_64;
+}
+
+static void parseClangOption(StringRef opt, const Twine &msg) {
+  std::string err;
+  raw_string_ostream os(err);
+
+  const char *argv[] = {config->progName.data(), opt.data()};
+  if (cl::ParseCommandLineOptions(2, argv, "", &os))
+    return;
+  os.flush();
+  error(msg + ": " + StringRef(err).trim());
+}
+
+// Checks the parameter of the bti-report and cet-report options.
+static bool isValidReportString(StringRef arg) {
+  return arg == "none" || arg == "warning" || arg == "error";
+}
+
+// Process a remap pattern 'from-glob=to-file'.
+static bool remapInputs(StringRef line, const Twine &location) {
+  SmallVector<StringRef, 0> fields;
+  line.split(fields, '=');
+  if (fields.size() != 2 || fields[1].empty()) {
+    error(location + ": parse error, not 'from-glob=to-file'");
+    return true;
+  }
+  if (!hasWildcard(fields[0]))
+    config->remapInputs[fields[0]] = fields[1];
+  else if (Expected<GlobPattern> pat = GlobPattern::create(fields[0]))
+    config->remapInputsWildcards.emplace_back(std::move(*pat), fields[1]);
+  else {
+    error(location + ": " + toString(pat.takeError()));
+    return true;
+  }
+  return false;
+}
+
+// Initializes Config members by the command line options.
+static void readConfigs(opt::InputArgList &args) {
+  errorHandler().verbose = args.hasArg(OPT_verbose);
+  errorHandler().vsDiagnostics =
+      args.hasArg(OPT_visual_studio_diagnostics_format, false);
+
+  config->allowMultipleDefinition =
+      args.hasFlag(OPT_allow_multiple_definition,
+                   OPT_no_allow_multiple_definition, false) ||
+      hasZOption(args, "muldefs");
+  config->androidMemtagHeap =
+      args.hasFlag(OPT_android_memtag_heap, OPT_no_android_memtag_heap, false);
+  config->androidMemtagStack = args.hasFlag(OPT_android_memtag_stack,
+                                            OPT_no_android_memtag_stack, false);
+  config->androidMemtagMode = getMemtagMode(args);
+  config->auxiliaryList = args::getStrings(args, OPT_auxiliary);
+  config->armBe8 = args.hasArg(OPT_be8);
+  if (opt::Arg *arg =
+          args.getLastArg(OPT_Bno_symbolic, OPT_Bsymbolic_non_weak_functions,
+                          OPT_Bsymbolic_functions, OPT_Bsymbolic)) {
+    if (arg->getOption().matches(OPT_Bsymbolic_non_weak_functions))
+      config->bsymbolic = BsymbolicKind::NonWeakFunctions;
+    else if (arg->getOption().matches(OPT_Bsymbolic_functions))
+      config->bsymbolic = BsymbolicKind::Functions;
+    else if (arg->getOption().matches(OPT_Bsymbolic))
+      config->bsymbolic = BsymbolicKind::All;
+  }
+  config->checkSections =
+      args.hasFlag(OPT_check_sections, OPT_no_check_sections, true);
+  config->chroot = args.getLastArgValue(OPT_chroot);
+  config->compressDebugSections = getCompressionType(
+      args.getLastArgValue(OPT_compress_debug_sections, "none"),
+      "--compress-debug-sections");
+  config->cref = args.hasArg(OPT_cref);
+  config->csgoRFE = !args.hasArg(OPT_disable_csgo_rfe);
+  config->optimizeBBJumps =
+      args.hasFlag(OPT_optimize_bb_jumps, OPT_no_optimize_bb_jumps, false);
+  config->demangle = args.hasFlag(OPT_demangle, OPT_no_demangle, true);
+  config->dependencyFile = args.getLastArgValue(OPT_dependency_file);
+  config->dependentLibraries = args.hasFlag(OPT_dependent_libraries, OPT_no_dependent_libraries, true);
+  config->disableVerify = args.hasArg(OPT_disable_verify);
+  config->discard = getDiscard(args);
+  config->dwoDir = args.getLastArgValue(OPT_plugin_opt_dwo_dir_eq);
+  config->dynamicLinker = getDynamicLinker(args);
+  config->ehFrameHdr =
+      args.hasFlag(OPT_eh_frame_hdr, OPT_no_eh_frame_hdr, false);
+  config->emitLLVM = args.hasArg(OPT_plugin_opt_emit_llvm, false);
+  config->emitRelocs = args.hasArg(OPT_emit_relocs, true);
+  config->callGraphProfileSort = args.hasFlag(
+      OPT_call_graph_profile_sort, OPT_no_call_graph_profile_sort, true);
+  config->enableNewDtags =
+      args.hasFlag(OPT_enable_new_dtags, OPT_disable_new_dtags, true);
+  config->entry = args.getLastArgValue(OPT_entry);
+
+  errorHandler().errorHandlingScript =
+      args.getLastArgValue(OPT_error_handling_script);
+
+  config->executeOnly =
+      args.hasFlag(OPT_execute_only, OPT_no_execute_only, false);
+  config->exportDynamic =
+      args.hasFlag(OPT_export_dynamic, OPT_no_export_dynamic, false) ||
+      args.hasArg(OPT_shared);
+  config->filterList = args::getStrings(args, OPT_filter);
+  config->fini = args.getLastArgValue(OPT_fini, "_fini");
+  config->fixCortexA53Errata843419 = args.hasArg(OPT_fix_cortex_a53_843419) &&
+                                     !args.hasArg(OPT_relocatable);
+  config->cmseImplib = args.hasArg(OPT_cmse_implib);
+  config->cmseInputLib = args.getLastArgValue(OPT_in_implib);
+  config->cmseOutputLib = args.getLastArgValue(OPT_out_implib);
+  config->fixCortexA8 =
+      args.hasArg(OPT_fix_cortex_a8) && !args.hasArg(OPT_relocatable);
+  config->fortranCommon =
+      args.hasFlag(OPT_fortran_common, OPT_no_fortran_common, false);
+  config->gcSections = args.hasFlag(OPT_gc_sections, OPT_no_gc_sections, true);
+  config->gnuUnique = args.hasFlag(OPT_gnu_unique, OPT_no_gnu_unique, true);
+  config->gdbIndex = args.hasFlag(OPT_gdb_index, OPT_no_gdb_index, false);
+  config->icf = getICF(args);
+  config->ignoreDataAddressEquality =
+      args.hasArg(OPT_ignore_data_address_equality);
+  config->ignoreFunctionAddressEquality =
+      args.hasArg(OPT_ignore_function_address_equality);
+  config->init = args.getLastArgValue(OPT_init, "_init");
+  config->ltoAAPipeline = args.getLastArgValue(OPT_lto_aa_pipeline);
+  config->ltoCSProfileGenerate = args.hasArg(OPT_lto_cs_profile_generate);
+  config->ltoCSProfileFile = args.getLastArgValue(OPT_lto_cs_profile_file);
+  config->ltoPGOWarnMismatch = args.hasFlag(OPT_lto_pgo_warn_mismatch,
+                                            OPT_no_lto_pgo_warn_mismatch, true);
+  config->ltoDebugPassManager = args.hasArg(OPT_lto_debug_pass_manager);
+  config->ltoEmitAsm = args.hasArg(OPT_lto_emit_asm);
+  config->ltoNewPmPasses = args.getLastArgValue(OPT_lto_newpm_passes);
+  config->ltoWholeProgramVisibility =
+      args.hasFlag(OPT_lto_whole_program_visibility,
+                   OPT_no_lto_whole_program_visibility, false);
+  config->ltoo = args::getInteger(args, OPT_lto_O, 2);
+  if (config->ltoo > 3)
+    error("invalid optimization level for LTO: " + Twine(config->ltoo));
+  unsigned ltoCgo =
+      args::getInteger(args, OPT_lto_CGO, args::getCGOptLevel(config->ltoo));
+  if (auto level = CodeGenOpt::getLevel(ltoCgo))
+    config->ltoCgo = *level;
+  else
+    error("invalid codegen optimization level for LTO: " + Twine(ltoCgo));
+  config->ltoObjPath = args.getLastArgValue(OPT_lto_obj_path_eq);
+  config->ltoPartitions = args::getInteger(args, OPT_lto_partitions, 1);
+  config->ltoSampleProfile = args.getLastArgValue(OPT_lto_sample_profile);
+  config->ltoBasicBlockSections =
+      args.getLastArgValue(OPT_lto_basic_block_sections);
+  config->ltoUniqueBasicBlockSectionNames =
+      args.hasFlag(OPT_lto_unique_basic_block_section_names,
+                   OPT_no_lto_unique_basic_block_section_names, false);
+  config->mapFile = args.getLastArgValue(OPT_Map);
+  config->mipsGotSize = args::getInteger(args, OPT_mips_got_size, 0xfff0);
+  config->mergeArmExidx =
+      args.hasFlag(OPT_merge_exidx_entries, OPT_no_merge_exidx_entries, true);
+  config->mmapOutputFile =
+      args.hasFlag(OPT_mmap_output_file, OPT_no_mmap_output_file, true);
+  config->nmagic = args.hasFlag(OPT_nmagic, OPT_no_nmagic, false);
+  config->noinhibitExec = args.hasArg(OPT_noinhibit_exec);
+  config->nostdlib = args.hasArg(OPT_nostdlib);
+  config->oFormatBinary = isOutputFormatBinary(args);
+  config->omagic = args.hasFlag(OPT_omagic, OPT_no_omagic, false);
+  config->optRemarksFilename = args.getLastArgValue(OPT_opt_remarks_filename);
+  config->optStatsFilename = args.getLastArgValue(OPT_plugin_opt_stats_file);
+
+  // Parse remarks hotness threshold. Valid value is either integer or 'auto'.
+  if (auto *arg = args.getLastArg(OPT_opt_remarks_hotness_threshold)) {
+    auto resultOrErr = remarks::parseHotnessThresholdOption(arg->getValue());
+    if (!resultOrErr)
+      error(arg->getSpelling() + ": invalid argument '" + arg->getValue() +
+            "', only integer or 'auto' is supported");
+    else
+      config->optRemarksHotnessThreshold = *resultOrErr;
+  }
+
+  config->optRemarksPasses = args.getLastArgValue(OPT_opt_remarks_passes);
+  config->optRemarksWithHotness = args.hasArg(OPT_opt_remarks_with_hotness);
+  config->optRemarksFormat = args.getLastArgValue(OPT_opt_remarks_format);
+  config->optimize = args::getInteger(args, OPT_O, 1);
+  config->orphanHandling = getOrphanHandling(args);
+  config->outputFile = args.getLastArgValue(OPT_o);
+  config->packageMetadata = args.getLastArgValue(OPT_package_metadata);
+  config->pie = args.hasFlag(OPT_pie, OPT_no_pie, false);
+  config->printIcfSections =
+      args.hasFlag(OPT_print_icf_sections, OPT_no_print_icf_sections, false);
+  config->printGcSections =
+      args.hasFlag(OPT_print_gc_sections, OPT_no_print_gc_sections, false);
+  config->printMemoryUsage = args.hasArg(OPT_print_memory_usage);
+  config->printArchiveStats = args.getLastArgValue(OPT_print_archive_stats);
+  config->printSymbolOrder =
+      args.getLastArgValue(OPT_print_symbol_order);
+  config->relax = args.hasFlag(OPT_relax, OPT_no_relax, true);
+  config->relaxGP = args.hasFlag(OPT_relax_gp, OPT_no_relax_gp, true);
+  config->rpath = getRpath(args);
+  config->relocatable = args.hasArg(OPT_relocatable);
+
+  if (args.hasArg(OPT_save_temps)) {
+    // --save-temps implies saving all temps.
+    for (const char *s : saveTempsValues)
+      config->saveTempsArgs.insert(s);
+  } else {
+    for (auto *arg : args.filtered(OPT_save_temps_eq)) {
+      StringRef s = arg->getValue();
+      if (llvm::is_contained(saveTempsValues, s))
+        config->saveTempsArgs.insert(s);
+      else
+        error("unknown --save-temps value: " + s);
+    }
+  }
+
+  config->searchPaths = args::getStrings(args, OPT_library_path);
+  config->sectionStartMap = getSectionStartMap(args);
+  config->shared = args.hasArg(OPT_shared);
+  config->singleRoRx = !args.hasFlag(OPT_rosegment, OPT_no_rosegment, true);
+  config->soName = args.getLastArgValue(OPT_soname);
+  config->sortSection = getSortSection(args);
+  config->splitStackAdjustSize = args::getInteger(args, OPT_split_stack_adjust_size, 16384);
+  config->strip = getStrip(args);
+  config->sysroot = args.getLastArgValue(OPT_sysroot);
+  config->target1Rel = args.hasFlag(OPT_target1_rel, OPT_target1_abs, false);
+  config->target2 = getTarget2(args);
+  config->thinLTOCacheDir = args.getLastArgValue(OPT_thinlto_cache_dir);
+  config->thinLTOCachePolicy = CHECK(
+      parseCachePruningPolicy(args.getLastArgValue(OPT_thinlto_cache_policy)),
+      "--thinlto-cache-policy: invalid cache policy");
+  config->thinLTOEmitImportsFiles = args.hasArg(OPT_thinlto_emit_imports_files);
+  config->thinLTOEmitIndexFiles = args.hasArg(OPT_thinlto_emit_index_files) ||
+                                  args.hasArg(OPT_thinlto_index_only) ||
+                                  args.hasArg(OPT_thinlto_index_only_eq);
+  config->thinLTOIndexOnly = args.hasArg(OPT_thinlto_index_only) ||
+                             args.hasArg(OPT_thinlto_index_only_eq);
+  config->thinLTOIndexOnlyArg = args.getLastArgValue(OPT_thinlto_index_only_eq);
+  config->thinLTOObjectSuffixReplace =
+      getOldNewOptions(args, OPT_thinlto_object_suffix_replace_eq);
+  std::tie(config->thinLTOPrefixReplaceOld, config->thinLTOPrefixReplaceNew,
+           config->thinLTOPrefixReplaceNativeObject) =
+      getOldNewOptionsExtra(args, OPT_thinlto_prefix_replace_eq);
+  if (config->thinLTOEmitIndexFiles && !config->thinLTOIndexOnly) {
+    if (args.hasArg(OPT_thinlto_object_suffix_replace_eq))
+      error("--thinlto-object-suffix-replace is not supported with "
+            "--thinlto-emit-index-files");
+    else if (args.hasArg(OPT_thinlto_prefix_replace_eq))
+      error("--thinlto-prefix-replace is not supported with "
+            "--thinlto-emit-index-files");
+  }
+  if (!config->thinLTOPrefixReplaceNativeObject.empty() &&
+      config->thinLTOIndexOnlyArg.empty()) {
+    error("--thinlto-prefix-replace=old_dir;new_dir;obj_dir must be used with "
+          "--thinlto-index-only=");
+  }
+  config->thinLTOModulesToCompile =
+      args::getStrings(args, OPT_thinlto_single_module_eq);
+  config->timeTraceEnabled = args.hasArg(OPT_time_trace_eq);
+  config->timeTraceGranularity =
+      args::getInteger(args, OPT_time_trace_granularity, 500);
+  config->trace = args.hasArg(OPT_trace);
+  config->undefined = args::getStrings(args, OPT_undefined);
+  config->undefinedVersion =
+      args.hasFlag(OPT_undefined_version, OPT_no_undefined_version, false);
+  config->unique = args.hasArg(OPT_unique);
+  config->useAndroidRelrTags = args.hasFlag(
+      OPT_use_android_relr_tags, OPT_no_use_android_relr_tags, false);
+  config->warnBackrefs =
+      args.hasFlag(OPT_warn_backrefs, OPT_no_warn_backrefs, false);
+  config->warnCommon = args.hasFlag(OPT_warn_common, OPT_no_warn_common, false);
+  config->warnSymbolOrdering =
+      args.hasFlag(OPT_warn_symbol_ordering, OPT_no_warn_symbol_ordering, true);
+  config->whyExtract = args.getLastArgValue(OPT_why_extract);
+  config->zCombreloc = getZFlag(args, "combreloc", "nocombreloc", true);
+  config->zCopyreloc = getZFlag(args, "copyreloc", "nocopyreloc", true);
+  config->zForceBti = hasZOption(args, "force-bti");
+  config->zForceIbt = hasZOption(args, "force-ibt");
+  config->zGlobal = hasZOption(args, "global");
+  config->zGnustack = getZGnuStack(args);
+  config->zHazardplt = hasZOption(args, "hazardplt");
+  config->zIfuncNoplt = hasZOption(args, "ifunc-noplt");
+  config->zInitfirst = hasZOption(args, "initfirst");
+  config->zInterpose = hasZOption(args, "interpose");
+  config->zKeepTextSectionPrefix = getZFlag(
+      args, "keep-text-section-prefix", "nokeep-text-section-prefix", false);
+  config->zNodefaultlib = hasZOption(args, "nodefaultlib");
+  config->zNodelete = hasZOption(args, "nodelete");
+  config->zNodlopen = hasZOption(args, "nodlopen");
+  config->zNow = getZFlag(args, "now", "lazy", false);
+  config->zOrigin = hasZOption(args, "origin");
+  config->zPacPlt = hasZOption(args, "pac-plt");
+  config->zRelro = getZFlag(args, "relro", "norelro", true);
+  config->zRetpolineplt = hasZOption(args, "retpolineplt");
+  config->zRodynamic = hasZOption(args, "rodynamic");
+  config->zSeparate = getZSeparate(args);
+  config->zShstk = hasZOption(args, "shstk");
+  config->zStackSize = args::getZOptionValue(args, OPT_z, "stack-size", 0);
+  config->zStartStopGC =
+      getZFlag(args, "start-stop-gc", "nostart-stop-gc", true);
+  config->zStartStopVisibility = getZStartStopVisibility(args);
+  config->zText = getZFlag(args, "text", "notext", true);
+  config->zWxneeded = hasZOption(args, "wxneeded");
+  setUnresolvedSymbolPolicy(args);
+  config->power10Stubs = args.getLastArgValue(OPT_power10_stubs_eq) != "no";
+
+  if (opt::Arg *arg = args.getLastArg(OPT_eb, OPT_el)) {
+    if (arg->getOption().matches(OPT_eb))
+      config->optEB = true;
+    else
+      config->optEL = true;
+  }
+
+  for (opt::Arg *arg : args.filtered(OPT_remap_inputs)) {
+    StringRef value(arg->getValue());
+    remapInputs(value, arg->getSpelling());
+  }
+  for (opt::Arg *arg : args.filtered(OPT_remap_inputs_file)) {
+    StringRef filename(arg->getValue());
+    std::optional<MemoryBufferRef> buffer = readFile(filename);
+    if (!buffer)
+      continue;
+    // Parse 'from-glob=to-file' lines, ignoring #-led comments.
+    for (auto [lineno, line] : llvm::enumerate(args::getLines(*buffer)))
+      if (remapInputs(line, filename + ":" + Twine(lineno + 1)))
+        break;
+  }
+
+  for (opt::Arg *arg : args.filtered(OPT_shuffle_sections)) {
+    constexpr StringRef errPrefix = "--shuffle-sections=: ";
+    std::pair<StringRef, StringRef> kv = StringRef(arg->getValue()).split('=');
+    if (kv.first.empty() || kv.second.empty()) {
+      error(errPrefix + "expected <section_glob>=<seed>, but got '" +
+            arg->getValue() + "'");
+      continue;
+    }
+    // Signed so that <section_glob>=-1 is allowed.
+    int64_t v;
+    if (!to_integer(kv.second, v))
+      error(errPrefix + "expected an integer, but got '" + kv.second + "'");
+    else if (Expected<GlobPattern> pat = GlobPattern::create(kv.first))
+      config->shuffleSections.emplace_back(std::move(*pat), uint32_t(v));
+    else
+      error(errPrefix + toString(pat.takeError()));
+  }
+
+  auto reports = {std::make_pair("bti-report", &config->zBtiReport),
+                  std::make_pair("cet-report", &config->zCetReport)};
+  for (opt::Arg *arg : args.filtered(OPT_z)) {
+    std::pair<StringRef, StringRef> option =
+        StringRef(arg->getValue()).split('=');
+    for (auto reportArg : reports) {
+      if (option.first != reportArg.first)
+        continue;
+      if (!isValidReportString(option.second)) {
+        error(Twine("-z ") + reportArg.first + "= parameter " + option.second +
+              " is not recognized");
+        continue;
+      }
+      *reportArg.second = option.second;
+    }
+  }
+
+  for (opt::Arg *arg : args.filtered(OPT_z)) {
+    std::pair<StringRef, StringRef> option =
+        StringRef(arg->getValue()).split('=');
+    if (option.first != "dead-reloc-in-nonalloc")
+      continue;
+    constexpr StringRef errPrefix = "-z dead-reloc-in-nonalloc=: ";
+    std::pair<StringRef, StringRef> kv = option.second.split('=');
+    if (kv.first.empty() || kv.second.empty()) {
+      error(errPrefix + "expected <section_glob>=<value>");
+      continue;
+    }
+    uint64_t v;
+    if (!to_integer(kv.second, v))
+      error(errPrefix + "expected a non-negative integer, but got '" +
+            kv.second + "'");
+    else if (Expected<GlobPattern> pat = GlobPattern::create(kv.first))
+      config->deadRelocInNonAlloc.emplace_back(std::move(*pat), v);
+    else
+      error(errPrefix + toString(pat.takeError()));
+  }
+
+  cl::ResetAllOptionOccurrences();
+
+  // Parse LTO options.
+  if (auto *arg = args.getLastArg(OPT_plugin_opt_mcpu_eq))
+    parseClangOption(saver().save("-mcpu=" + StringRef(arg->getValue())),
+                     arg->getSpelling());
+
+  for (opt::Arg *arg : args.filtered(OPT_plugin_opt_eq_minus))
+    parseClangOption(std::string("-") + arg->getValue(), arg->getSpelling());
+
+  // GCC collect2 passes -plugin-opt=path/to/lto-wrapper with an absolute or
+  // relative path. Just ignore. If not ended with "lto-wrapper" (or
+  // "lto-wrapper.exe" for GCC cross-compiled for Windows), consider it an
+  // unsupported LLVMgold.so option and error.
+  for (opt::Arg *arg : args.filtered(OPT_plugin_opt_eq)) {
+    StringRef v(arg->getValue());
+    if (!v.ends_with("lto-wrapper") && !v.ends_with("lto-wrapper.exe"))
+      error(arg->getSpelling() + ": unknown plugin option '" + arg->getValue() +
+            "'");
+  }
+
+  config->passPlugins = args::getStrings(args, OPT_load_pass_plugins);
+
+  // Parse -mllvm options.
+  for (const auto *arg : args.filtered(OPT_mllvm)) {
+    parseClangOption(arg->getValue(), arg->getSpelling());
+    config->mllvmOpts.emplace_back(arg->getValue());
+  }
+
+  config->ltoKind = LtoKind::Default;
+  if (auto *arg = args.getLastArg(OPT_lto)) {
+    StringRef s = arg->getValue();
+    if (s == "thin")
+      config->ltoKind = LtoKind::UnifiedThin;
+    else if (s == "full")
+      config->ltoKind = LtoKind::UnifiedRegular;
+    else if (s == "default")
+      config->ltoKind = LtoKind::Default;
+    else
+      error("unknown LTO mode: " + s);
+  }
+
+  // --threads= takes a positive integer and provides the default value for
+  // --thinlto-jobs=. If unspecified, cap the number of threads since
+  // overhead outweighs optimization for used parallel algorithms for the
+  // non-LTO parts.
+  if (auto *arg = args.getLastArg(OPT_threads)) {
+    StringRef v(arg->getValue());
+    unsigned threads = 0;
+    if (!llvm::to_integer(v, threads, 0) || threads == 0)
+      error(arg->getSpelling() + ": expected a positive integer, but got '" +
+            arg->getValue() + "'");
+    parallel::strategy = hardware_concurrency(threads);
+    config->thinLTOJobs = v;
+  } else if (parallel::strategy.compute_thread_count() > 16) {
+    log("set maximum concurrency to 16, specify --threads= to change");
+    parallel::strategy = hardware_concurrency(16);
+  }
+  if (auto *arg = args.getLastArg(OPT_thinlto_jobs_eq))
+    config->thinLTOJobs = arg->getValue();
+  config->threadCount = parallel::strategy.compute_thread_count();
+
+  if (config->ltoPartitions == 0)
+    error("--lto-partitions: number of threads must be > 0");
+  if (!get_threadpool_strategy(config->thinLTOJobs))
+    error("--thinlto-jobs: invalid job count: " + config->thinLTOJobs);
+
+  if (config->splitStackAdjustSize < 0)
+    error("--split-stack-adjust-size: size must be >= 0");
+
+  // The text segment is traditionally the first segment, whose address equals
+  // the base address. However, lld places the R PT_LOAD first. -Ttext-segment
+  // is an old-fashioned option that does not play well with lld's layout.
+  // Suggest --image-base as a likely alternative.
+  if (args.hasArg(OPT_Ttext_segment))
+    error("-Ttext-segment is not supported. Use --image-base if you "
+          "intend to set the base address");
+
+  // Parse ELF{32,64}{LE,BE} and CPU type.
+  if (auto *arg = args.getLastArg(OPT_m)) {
+    StringRef s = arg->getValue();
+    std::tie(config->ekind, config->emachine, config->osabi) =
+        parseEmulation(s);
+    config->mipsN32Abi =
+        (s.starts_with("elf32btsmipn32") || s.starts_with("elf32ltsmipn32"));
+    config->emulation = s;
+  }
+
+  // Parse --hash-style={sysv,gnu,both}.
+  if (auto *arg = args.getLastArg(OPT_hash_style)) {
+    StringRef s = arg->getValue();
+    if (s == "sysv")
+      config->sysvHash = true;
+    else if (s == "gnu")
+      config->gnuHash = true;
+    else if (s == "both")
+      config->sysvHash = config->gnuHash = true;
+    else
+      error("unknown --hash-style: " + s);
+  }
+
+  if (args.hasArg(OPT_print_map))
+    config->mapFile = "-";
+
+  // Page alignment can be disabled by the -n (--nmagic) and -N (--omagic).
+  // As PT_GNU_RELRO relies on Paging, do not create it when we have disabled
+  // it.
+  if (config->nmagic || config->omagic)
+    config->zRelro = false;
+
+  std::tie(config->buildId, config->buildIdVector) = getBuildId(args);
+
+  if (getZFlag(args, "pack-relative-relocs", "nopack-relative-relocs", false)) {
+    config->relrGlibc = true;
+    config->relrPackDynRelocs = true;
+  } else {
+    std::tie(config->androidPackDynRelocs, config->relrPackDynRelocs) =
+        getPackDynRelocs(args);
+  }
+
+  if (auto *arg = args.getLastArg(OPT_symbol_ordering_file)){
+    if (args.hasArg(OPT_call_graph_ordering_file))
+      error("--symbol-ordering-file and --call-graph-order-file "
+            "may not be used together");
+    if (std::optional<MemoryBufferRef> buffer = readFile(arg->getValue())) {
+      config->symbolOrderingFile = getSymbolOrderingFile(*buffer);
+      // Also need to disable CallGraphProfileSort to prevent
+      // LLD order symbols with CGProfile
+      config->callGraphProfileSort = false;
+    }
+  }
+
+  assert(config->versionDefinitions.empty());
+  config->versionDefinitions.push_back(
+      {"local", (uint16_t)VER_NDX_LOCAL, {}, {}});
+  config->versionDefinitions.push_back(
+      {"global", (uint16_t)VER_NDX_GLOBAL, {}, {}});
+
+  // If --retain-symbol-file is used, we'll keep only the symbols listed in
+  // the file and discard all others.
+  if (auto *arg = args.getLastArg(OPT_retain_symbols_file)) {
+    config->versionDefinitions[VER_NDX_LOCAL].nonLocalPatterns.push_back(
+        {"*", /*isExternCpp=*/false, /*hasWildcard=*/true});
+    if (std::optional<MemoryBufferRef> buffer = readFile(arg->getValue()))
+      for (StringRef s : args::getLines(*buffer))
+        config->versionDefinitions[VER_NDX_GLOBAL].nonLocalPatterns.push_back(
+            {s, /*isExternCpp=*/false, /*hasWildcard=*/false});
+  }
+
+  for (opt::Arg *arg : args.filtered(OPT_warn_backrefs_exclude)) {
+    StringRef pattern(arg->getValue());
+    if (Expected<GlobPattern> pat = GlobPattern::create(pattern))
+      config->warnBackrefsExclude.push_back(std::move(*pat));
+    else
+      error(arg->getSpelling() + ": " + toString(pat.takeError()));
+  }
+
+  // For -no-pie and -pie, --export-dynamic-symbol specifies defined symbols
+  // which should be exported. For -shared, references to matched non-local
+  // STV_DEFAULT symbols are not bound to definitions within the shared object,
+  // even if other options express a symbolic intention: -Bsymbolic,
+  // -Bsymbolic-functions (if STT_FUNC), --dynamic-list.
+  for (auto *arg : args.filtered(OPT_export_dynamic_symbol))
+    config->dynamicList.push_back(
+        {arg->getValue(), /*isExternCpp=*/false,
+         /*hasWildcard=*/hasWildcard(arg->getValue())});
+
+  // --export-dynamic-symbol-list specifies a list of --export-dynamic-symbol
+  // patterns. --dynamic-list is --export-dynamic-symbol-list plus -Bsymbolic
+  // like semantics.
+  config->symbolic =
+      config->bsymbolic == BsymbolicKind::All || args.hasArg(OPT_dynamic_list);
+  for (auto *arg :
+       args.filtered(OPT_dynamic_list, OPT_export_dynamic_symbol_list))
+    if (std::optional<MemoryBufferRef> buffer = readFile(arg->getValue()))
+      readDynamicList(*buffer);
+
+  for (auto *arg : args.filtered(OPT_version_script))
+    if (std::optional<std::string> path = searchScript(arg->getValue())) {
+      if (std::optional<MemoryBufferRef> buffer = readFile(*path))
+        readVersionScript(*buffer);
+    } else {
+      error(Twine("cannot find version script ") + arg->getValue());
+    }
+}
+
+// Some Config members do not directly correspond to any particular
+// command line options, but computed based on other Config values.
+// This function initialize such members. See Config.h for the details
+// of these values.
+static void setConfigs(opt::InputArgList &args) {
+  ELFKind k = config->ekind;
+  uint16_t m = config->emachine;
+
+  config->copyRelocs = (config->relocatable || config->emitRelocs);
+  config->is64 = (k == ELF64LEKind || k == ELF64BEKind);
+  config->isLE = (k == ELF32LEKind || k == ELF64LEKind);
+  config->endianness = config->isLE ? endianness::little : endianness::big;
+  config->isMips64EL = (k == ELF64LEKind && m == EM_MIPS);
+  config->isPic = config->pie || config->shared;
+  config->picThunk = args.hasArg(OPT_pic_veneer, config->isPic);
+  config->wordsize = config->is64 ? 8 : 4;
+
+  // ELF defines two different ways to store relocation addends as shown below:
+  //
+  //  Rel: Addends are stored to the location where relocations are applied. It
+  //  cannot pack the full range of addend values for all relocation types, but
+  //  this only affects relocation types that we don't support emitting as
+  //  dynamic relocations (see getDynRel).
+  //  Rela: Addends are stored as part of relocation entry.
+  //
+  // In other words, Rela makes it easy to read addends at the price of extra
+  // 4 or 8 byte for each relocation entry.
+  //
+  // We pick the format for dynamic relocations according to the psABI for each
+  // processor, but a contrary choice can be made if the dynamic loader
+  // supports.
+  config->isRela = getIsRela(args);
+
+  // If the output uses REL relocations we must store the dynamic relocation
+  // addends to the output sections. We also store addends for RELA relocations
+  // if --apply-dynamic-relocs is used.
+  // We default to not writing the addends when using RELA relocations since
+  // any standard conforming tool can find it in r_addend.
+  config->writeAddends = args.hasFlag(OPT_apply_dynamic_relocs,
+                                      OPT_no_apply_dynamic_relocs, false) ||
+                         !config->isRela;
+  // Validation of dynamic relocation addends is on by default for assertions
+  // builds (for supported targets) and disabled otherwise. Ideally we would
+  // enable the debug checks for all targets, but currently not all targets
+  // have support for reading Elf_Rel addends, so we only enable for a subset.
+#ifndef NDEBUG
+  bool checkDynamicRelocsDefault = m == EM_AARCH64 || m == EM_ARM ||
+                                   m == EM_386 || m == EM_LOONGARCH ||
+                                   m == EM_MIPS || m == EM_RISCV ||
+                                   m == EM_X86_64;
+#else
+  bool checkDynamicRelocsDefault = false;
+#endif
+  config->checkDynamicRelocs =
+      args.hasFlag(OPT_check_dynamic_relocations,
+                   OPT_no_check_dynamic_relocations, checkDynamicRelocsDefault);
+  config->tocOptimize =
+      args.hasFlag(OPT_toc_optimize, OPT_no_toc_optimize, m == EM_PPC64);
+  config->pcRelOptimize =
+      args.hasFlag(OPT_pcrel_optimize, OPT_no_pcrel_optimize, m == EM_PPC64);
+}
+
+static bool isFormatBinary(StringRef s) {
+  if (s == "binary")
+    return true;
+  if (s == "elf" || s == "default")
+    return false;
+  error("unknown --format value: " + s +
+        " (supported formats: elf, default, binary)");
+  return false;
+}
+
+void LinkerDriver::createFiles(opt::InputArgList &args) {
+  llvm::TimeTraceScope timeScope("Load input files");
+  // For --{push,pop}-state.
+  std::vector<std::tuple<bool, bool, bool>> stack;
+  // Iterate over argv to process input files and positional arguments.
+  InputFile::isInGroup = false;
+  bool hasInput = false;
+  for (auto *arg : args) {
+    switch (arg->getOption().getID()) {
+    case OPT_library:
+      addLibrary(arg->getValue());
+      hasInput = true;
+      break;
+    case OPT_INPUT:
+      addFile(arg->getValue(), /*withLOption=*/false);
+      hasInput = true;
+      break;
+    case OPT_defsym: {
+      StringRef from;
+      StringRef to;
+      std::tie(from, to) = StringRef(arg->getValue()).split('=');
+      if (from.empty() || to.empty())
+        error("--defsym: syntax error: " + StringRef(arg->getValue()));
+      else
+        readDefsym(from, MemoryBufferRef(to, "--defsym"));
+      break;
+    }
+    case OPT_script:
+      if (std::optional<std::string> path = searchScript(arg->getValue())) {
+        if (std::optional<MemoryBufferRef> mb = readFile(*path))
+          readLinkerScript(*mb);
+        break;
+      }
+      error(Twine("cannot find linker script ") + arg->getValue());
+      break;
+    case OPT_as_needed:
+      config->asNeeded = true;
+      break;
+    case OPT_format:
+      config->formatBinary = isFormatBinary(arg->getValue());
+      break;
+    case OPT_no_as_needed:
+      config->asNeeded = false;
+      break;
+    case OPT_Bstatic:
+    case OPT_omagic:
+    case OPT_nmagic:
+      config->isStatic = true;
+      break;
+    case OPT_Bdynamic:
+      config->isStatic = false;
+      break;
+    case OPT_whole_archive:
+      inWholeArchive = true;
+      break;
+    case OPT_no_whole_archive:
+      inWholeArchive = false;
+      break;
+    case OPT_just_symbols:
+      if (std::optional<MemoryBufferRef> mb = readFile(arg->getValue())) {
+        files.push_back(createObjFile(*mb));
+        files.back()->justSymbols = true;
+      }
+      break;
+    case OPT_in_implib:
+      if (armCmseImpLib)
+        error("multiple CMSE import libraries not supported");
+      else if (std::optional<MemoryBufferRef> mb = readFile(arg->getValue()))
+        armCmseImpLib = createObjFile(*mb);
+      break;
+    case OPT_start_group:
+      if (InputFile::isInGroup)
+        error("nested --start-group");
+      InputFile::isInGroup = true;
+      break;
+    case OPT_end_group:
+      if (!InputFile::isInGroup)
+        error("stray --end-group");
+      InputFile::isInGroup = false;
+      ++InputFile::nextGroupId;
+      break;
+    case OPT_start_lib:
+      if (inLib)
+        error("nested --start-lib");
+      if (InputFile::isInGroup)
+        error("may not nest --start-lib in --start-group");
+      inLib = true;
+      InputFile::isInGroup = true;
+      break;
+    case OPT_end_lib:
+      if (!inLib)
+        error("stray --end-lib");
+      inLib = false;
+      InputFile::isInGroup = false;
+      ++InputFile::nextGroupId;
+      break;
+    case OPT_push_state:
+      stack.emplace_back(config->asNeeded, config->isStatic, inWholeArchive);
+      break;
+    case OPT_pop_state:
+      if (stack.empty()) {
+        error("unbalanced --push-state/--pop-state");
+        break;
+      }
+      std::tie(config->asNeeded, config->isStatic, inWholeArchive) = stack.back();
+      stack.pop_back();
+      break;
+    }
+  }
+
+  if (files.empty() && !hasInput && errorCount() == 0)
+    error("no input files");
+}
+
+// If -m <machine_type> was not given, infer it from object files.
+void LinkerDriver::inferMachineType() {
+  if (config->ekind != ELFNoneKind)
+    return;
+
+  for (InputFile *f : files) {
+    if (f->ekind == ELFNoneKind)
+      continue;
+    config->ekind = f->ekind;
+    config->emachine = f->emachine;
+    config->osabi = f->osabi;
+    config->mipsN32Abi = config->emachine == EM_MIPS && isMipsN32Abi(f);
+    return;
+  }
+  error("target emulation unknown: -m or at least one .o file required");
+}
+
+// Parse -z max-page-size=<value>. The default value is defined by
+// each target.
+static uint64_t getMaxPageSize(opt::InputArgList &args) {
+  uint64_t val = args::getZOptionValue(args, OPT_z, "max-page-size",
+                                       target->defaultMaxPageSize);
+  if (!isPowerOf2_64(val)) {
+    error("max-page-size: value isn't a power of 2");
+    return target->defaultMaxPageSize;
+  }
+  if (config->nmagic || config->omagic) {
+    if (val != target->defaultMaxPageSize)
+      warn("-z max-page-size set, but paging disabled by omagic or nmagic");
+    return 1;
+  }
+  return val;
+}
+
+// Parse -z common-page-size=<value>. The default value is defined by
+// each target.
+static uint64_t getCommonPageSize(opt::InputArgList &args) {
+  uint64_t val = args::getZOptionValue(args, OPT_z, "common-page-size",
+                                       target->defaultCommonPageSize);
+  if (!isPowerOf2_64(val)) {
+    error("common-page-size: value isn't a power of 2");
+    return target->defaultCommonPageSize;
+  }
+  if (config->nmagic || config->omagic) {
+    if (val != target->defaultCommonPageSize)
+      warn("-z common-page-size set, but paging disabled by omagic or nmagic");
+    return 1;
+  }
+  // commonPageSize can't be larger than maxPageSize.
+  if (val > config->maxPageSize)
+    val = config->maxPageSize;
+  return val;
+}
+
+// Parses --image-base option.
+static std::optional<uint64_t> getImageBase(opt::InputArgList &args) {
+  // Because we are using "Config->maxPageSize" here, this function has to be
+  // called after the variable is initialized.
+  auto *arg = args.getLastArg(OPT_image_base);
+  if (!arg)
+    return std::nullopt;
+
+  StringRef s = arg->getValue();
+  uint64_t v;
+  if (!to_integer(s, v)) {
+    error("--image-base: number expected, but got " + s);
+    return 0;
+  }
+  if ((v % config->maxPageSize) != 0)
+    warn("--image-base: address isn't multiple of page size: " + s);
+  return v;
+}
+
+// Parses `--exclude-libs=lib,lib,...`.
+// The library names may be delimited by commas or colons.
+static DenseSet<StringRef> getExcludeLibs(opt::InputArgList &args) {
+  DenseSet<StringRef> ret;
+  for (auto *arg : args.filtered(OPT_exclude_libs)) {
+    StringRef s = arg->getValue();
+    for (;;) {
+      size_t pos = s.find_first_of(",:");
+      if (pos == StringRef::npos)
+        break;
+      ret.insert(s.substr(0, pos));
+      s = s.substr(pos + 1);
+    }
+    ret.insert(s);
+  }
+  return ret;
+}
+
+// Handles the --exclude-libs option. If a static library file is specified
+// by the --exclude-libs option, all public symbols from the archive become
+// private unless otherwise specified by version scripts or something.
+// A special library name "ALL" means all archive files.
+//
+// This is not a popular option, but some programs such as bionic libc use it.
+static void excludeLibs(opt::InputArgList &args) {
+  DenseSet<StringRef> libs = getExcludeLibs(args);
+  bool all = libs.count("ALL");
+
+  auto visit = [&](InputFile *file) {
+    if (file->archiveName.empty() ||
+        !(all || libs.count(path::filename(file->archiveName))))
+      return;
+    ArrayRef<Symbol *> symbols = file->getSymbols();
+    if (isa<ELFFileBase>(file))
+      symbols = cast<ELFFileBase>(file)->getGlobalSymbols();
+    for (Symbol *sym : symbols)
+      if (!sym->isUndefined() && sym->file == file)
+        sym->versionId = VER_NDX_LOCAL;
+  };
+
+  for (ELFFileBase *file : ctx.objectFiles)
+    visit(file);
+
+  for (BitcodeFile *file : ctx.bitcodeFiles)
+    visit(file);
+}
+
+// Force Sym to be entered in the output.
+static void handleUndefined(Symbol *sym, const char *option) {
+  // Since a symbol may not be used inside the program, LTO may
+  // eliminate it. Mark the symbol as "used" to prevent it.
+  sym->isUsedInRegularObj = true;
+
+  if (!sym->isLazy())
+    return;
+  sym->extract();
+  if (!config->whyExtract.empty())
+    ctx.whyExtractRecords.emplace_back(option, sym->file, *sym);
+}
+
+// As an extension to GNU linkers, lld supports a variant of `-u`
+// which accepts wildcard patterns. All symbols that match a given
+// pattern are handled as if they were given by `-u`.
+static void handleUndefinedGlob(StringRef arg) {
+  Expected<GlobPattern> pat = GlobPattern::create(arg);
+  if (!pat) {
+    error("--undefined-glob: " + toString(pat.takeError()));
+    return;
+  }
+
+  // Calling sym->extract() in the loop is not safe because it may add new
+  // symbols to the symbol table, invalidating the current iterator.
+  SmallVector<Symbol *, 0> syms;
+  for (Symbol *sym : symtab.getSymbols())
+    if (!sym->isPlaceholder() && pat->match(sym->getName()))
+      syms.push_back(sym);
+
+  for (Symbol *sym : syms)
+    handleUndefined(sym, "--undefined-glob");
+}
+
+static void handleLibcall(StringRef name) {
+  Symbol *sym = symtab.find(name);
+  if (!sym || !sym->isLazy())
+    return;
+
+  MemoryBufferRef mb;
+  mb = cast<LazyObject>(sym)->file->mb;
+
+  if (isBitcode(mb))
+    sym->extract();
+}
+
+static void writeArchiveStats() {
+  if (config->printArchiveStats.empty())
+    return;
+
+  std::error_code ec;
+  raw_fd_ostream os = ctx.openAuxiliaryFile(config->printArchiveStats, ec);
+  if (ec) {
+    error("--print-archive-stats=: cannot open " + config->printArchiveStats +
+          ": " + ec.message());
+    return;
+  }
+
+  os << "members\textracted\tarchive\n";
+
+  SmallVector<StringRef, 0> archives;
+  DenseMap<CachedHashStringRef, unsigned> all, extracted;
+  for (ELFFileBase *file : ctx.objectFiles)
+    if (file->archiveName.size())
+      ++extracted[CachedHashStringRef(file->archiveName)];
+  for (BitcodeFile *file : ctx.bitcodeFiles)
+    if (file->archiveName.size())
+      ++extracted[CachedHashStringRef(file->archiveName)];
+  for (std::pair<StringRef, unsigned> f : ctx.driver.archiveFiles) {
+    unsigned &v = extracted[CachedHashString(f.first)];
+    os << f.second << '\t' << v << '\t' << f.first << '\n';
+    // If the archive occurs multiple times, other instances have a count of 0.
+    v = 0;
+  }
+}
+
+static void writeWhyExtract() {
+  if (config->whyExtract.empty())
+    return;
+
+  std::error_code ec;
+  raw_fd_ostream os = ctx.openAuxiliaryFile(config->whyExtract, ec);
+  if (ec) {
+    error("cannot open --why-extract= file " + config->whyExtract + ": " +
+          ec.message());
+    return;
+  }
+
+  os << "reference\textracted\tsymbol\n";
+  for (auto &entry : ctx.whyExtractRecords) {
+    os << std::get<0>(entry) << '\t' << toString(std::get<1>(entry)) << '\t'
+       << toString(std::get<2>(entry)) << '\n';
+  }
+}
+
+static void reportBackrefs() {
+  for (auto &ref : ctx.backwardReferences) {
+    const Symbol &sym = *ref.first;
+    std::string to = toString(ref.second.second);
+    // Some libraries have known problems and can cause noise. Filter them out
+    // with --warn-backrefs-exclude=. The value may look like (for --start-lib)
+    // *.o or (archive member) *.a(*.o).
+    bool exclude = false;
+    for (const llvm::GlobPattern &pat : config->warnBackrefsExclude)
+      if (pat.match(to)) {
+        exclude = true;
+        break;
+      }
+    if (!exclude)
+      warn("backward reference detected: " + sym.getName() + " in " +
+           toString(ref.second.first) + " refers to " + to);
+  }
+}
+
+// Handle --dependency-file=<path>. If that option is given, lld creates a
+// file at a given path with the following contents:
+//
+//   <output-file>: <input-file> ...
+//
+//   <input-file>:
+//
+// where <output-file> is a pathname of an output file and <input-file>
+// ... is a list of pathnames of all input files. `make` command can read a
+// file in the above format and interpret it as a dependency info. We write
+// phony targets for every <input-file> to avoid an error when that file is
+// removed.
+//
+// This option is useful if you want to make your final executable to depend
+// on all input files including system libraries. Here is why.
+//
+// When you write a Makefile, you usually write it so that the final
+// executable depends on all user-generated object files. Normally, you
+// don't make your executable to depend on system libraries (such as libc)
+// because you don't know the exact paths of libraries, even though system
+// libraries that are linked to your executable statically are technically a
+// part of your program. By using --dependency-file option, you can make
+// lld to dump dependency info so that you can maintain exact dependencies
+// easily.
+static void writeDependencyFile() {
+  std::error_code ec;
+  raw_fd_ostream os = ctx.openAuxiliaryFile(config->dependencyFile, ec);
+  if (ec) {
+    error("cannot open " + config->dependencyFile + ": " + ec.message());
+    return;
+  }
+
+  // We use the same escape rules as Clang/GCC which are accepted by Make/Ninja:
+  // * A space is escaped by a backslash which itself must be escaped.
+  // * A hash sign is escaped by a single backslash.
+  // * $ is escapes as $$.
+  auto printFilename = [](raw_fd_ostream &os, StringRef filename) {
+    llvm::SmallString<256> nativePath;
+    llvm::sys::path::native(filename.str(), nativePath);
+    llvm::sys::path::remove_dots(nativePath, /*remove_dot_dot=*/true);
+    for (unsigned i = 0, e = nativePath.size(); i != e; ++i) {
+      if (nativePath[i] == '#') {
+        os << '\\';
+      } else if (nativePath[i] == ' ') {
+        os << '\\';
+        unsigned j = i;
+        while (j > 0 && nativePath[--j] == '\\')
+          os << '\\';
+      } else if (nativePath[i] == '$') {
+        os << '$';
+      }
+      os << nativePath[i];
+    }
+  };
+
+  os << config->outputFile << ":";
+  for (StringRef path : config->dependencyFiles) {
+    os << " \\\n ";
+    printFilename(os, path);
+  }
+  os << "\n";
+
+  for (StringRef path : config->dependencyFiles) {
+    os << "\n";
+    printFilename(os, path);
+    os << ":\n";
+  }
+}
+
+// Replaces common symbols with defined symbols reside in .bss sections.
+// This function is called after all symbol names are resolved. As a
+// result, the passes after the symbol resolution won't see any
+// symbols of type CommonSymbol.
+static void replaceCommonSymbols() {
+  llvm::TimeTraceScope timeScope("Replace common symbols");
+  for (ELFFileBase *file : ctx.objectFiles) {
+    if (!file->hasCommonSyms)
+      continue;
+    for (Symbol *sym : file->getGlobalSymbols()) {
+      auto *s = dyn_cast<CommonSymbol>(sym);
+      if (!s)
+        continue;
+
+      auto *bss = make<BssSection>("COMMON", s->size, s->alignment);
+      bss->file = s->file;
+      ctx.inputSections.push_back(bss);
+      Defined(s->file, StringRef(), s->binding, s->stOther, s->type,
+              /*value=*/0, s->size, bss)
+          .overwrite(*s);
+    }
+  }
+}
+
+// If all references to a DSO happen to be weak, the DSO is not added to
+// DT_NEEDED. If that happens, replace ShardSymbol with Undefined to avoid
+// dangling references to an unneeded DSO. Use a weak binding to avoid
+// --no-allow-shlib-undefined diagnostics. Similarly, demote lazy symbols.
+static void demoteSharedAndLazySymbols() {
+  llvm::TimeTraceScope timeScope("Demote shared and lazy symbols");
+  for (Symbol *sym : symtab.getSymbols()) {
+    auto *s = dyn_cast<SharedSymbol>(sym);
+    if (!(s && !cast<SharedFile>(s->file)->isNeeded) && !sym->isLazy())
+      continue;
+
+    uint8_t binding = sym->isLazy() ? sym->binding : uint8_t(STB_WEAK);
+    Undefined(nullptr, sym->getName(), binding, sym->stOther, sym->type)
+        .overwrite(*sym);
+    sym->versionId = VER_NDX_GLOBAL;
+  }
+}
+
+// The section referred to by `s` is considered address-significant. Set the
+// keepUnique flag on the section if appropriate.
+static void markAddrsig(Symbol *s) {
+  if (auto *d = dyn_cast_or_null<Defined>(s))
+    if (d->section)
+      // We don't need to keep text sections unique under --icf=all even if they
+      // are address-significant.
+      if (config->icf == ICFLevel::Safe || !(d->section->flags & SHF_EXECINSTR))
+        d->section->keepUnique = true;
+}
+
+// Record sections that define symbols mentioned in --keep-unique <symbol>
+// and symbols referred to by address-significance tables. These sections are
+// ineligible for ICF.
+template <class ELFT>
+static void findKeepUniqueSections(opt::InputArgList &args) {
+  for (auto *arg : args.filtered(OPT_keep_unique)) {
+    StringRef name = arg->getValue();
+    auto *d = dyn_cast_or_null<Defined>(symtab.find(name));
+    if (!d || !d->section) {
+      warn("could not find symbol " + name + " to keep unique");
+      continue;
+    }
+    d->section->keepUnique = true;
+  }
+
+  // --icf=all --ignore-data-address-equality means that we can ignore
+  // the dynsym and address-significance tables entirely.
+  if (config->icf == ICFLevel::All && config->ignoreDataAddressEquality)
+    return;
+
+  // Symbols in the dynsym could be address-significant in other executables
+  // or DSOs, so we conservatively mark them as address-significant.
+  for (Symbol *sym : symtab.getSymbols())
+    if (sym->includeInDynsym())
+      markAddrsig(sym);
+
+  // Visit the address-significance table in each object file and mark each
+  // referenced symbol as address-significant.
+  for (InputFile *f : ctx.objectFiles) {
+    auto *obj = cast<ObjFile<ELFT>>(f);
+    ArrayRef<Symbol *> syms = obj->getSymbols();
+    if (obj->addrsigSec) {
+      ArrayRef<uint8_t> contents =
+          check(obj->getObj().getSectionContents(*obj->addrsigSec));
+      const uint8_t *cur = contents.begin();
+      while (cur != contents.end()) {
+        unsigned size;
+        const char *err;
+        uint64_t symIndex = decodeULEB128(cur, &size, contents.end(), &err);
+        if (err)
+          fatal(toString(f) + ": could not decode addrsig section: " + err);
+        markAddrsig(syms[symIndex]);
+        cur += size;
+      }
+    } else {
+      // If an object file does not have an address-significance table,
+      // conservatively mark all of its symbols as address-significant.
+      for (Symbol *s : syms)
+        markAddrsig(s);
+    }
+  }
+}
+
+// This function reads a symbol partition specification section. These sections
+// are used to control which partition a symbol is allocated to. See
+// https://lld.llvm.org/Partitions.html for more details on partitions.
+template <typename ELFT>
+static void readSymbolPartitionSection(InputSectionBase *s) {
+  // Read the relocation that refers to the partition's entry point symbol.
+  Symbol *sym;
+  const RelsOrRelas<ELFT> rels = s->template relsOrRelas<ELFT>();
+  if (rels.areRelocsRel())
+    sym = &s->getFile<ELFT>()->getRelocTargetSym(rels.rels[0]);
+  else
+    sym = &s->getFile<ELFT>()->getRelocTargetSym(rels.relas[0]);
+  if (!isa<Defined>(sym) || !sym->includeInDynsym())
+    return;
+
+  StringRef partName = reinterpret_cast<const char *>(s->content().data());
+  for (Partition &part : partitions) {
+    if (part.name == partName) {
+      sym->partition = part.getNumber();
+      return;
+    }
+  }
+
+  // Forbid partitions from being used on incompatible targets, and forbid them
+  // from being used together with various linker features that assume a single
+  // set of output sections.
+  if (script->hasSectionsCommand)
+    error(toString(s->file) +
+          ": partitions cannot be used with the SECTIONS command");
+  if (script->hasPhdrsCommands())
+    error(toString(s->file) +
+          ": partitions cannot be used with the PHDRS command");
+  if (!config->sectionStartMap.empty())
+    error(toString(s->file) + ": partitions cannot be used with "
+                              "--section-start, -Ttext, -Tdata or -Tbss");
+  if (config->emachine == EM_MIPS)
+    error(toString(s->file) + ": partitions cannot be used on this target");
+
+  // Impose a limit of no more than 254 partitions. This limit comes from the
+  // sizes of the Partition fields in InputSectionBase and Symbol, as well as
+  // the amount of space devoted to the partition number in RankFlags.
+  if (partitions.size() == 254)
+    fatal("may not have more than 254 partitions");
+
+  partitions.emplace_back();
+  Partition &newPart = partitions.back();
+  newPart.name = partName;
+  sym->partition = newPart.getNumber();
+}
+
+static Symbol *addUnusedUndefined(StringRef name,
+                                  uint8_t binding = STB_GLOBAL) {
+  return symtab.addSymbol(Undefined{nullptr, name, binding, STV_DEFAULT, 0});
+}
+
+static void markBuffersAsDontNeed(bool skipLinkedOutput) {
+  // With --thinlto-index-only, all buffers are nearly unused from now on
+  // (except symbol/section names used by infrequent passes). Mark input file
+  // buffers as MADV_DONTNEED so that these pages can be reused by the expensive
+  // thin link, saving memory.
+  if (skipLinkedOutput) {
+    for (MemoryBuffer &mb : llvm::make_pointee_range(ctx.memoryBuffers))
+      mb.dontNeedIfMmap();
+    return;
+  }
+
+  // Otherwise, just mark MemoryBuffers backing BitcodeFiles.
+  DenseSet<const char *> bufs;
+  for (BitcodeFile *file : ctx.bitcodeFiles)
+    bufs.insert(file->mb.getBufferStart());
+  for (BitcodeFile *file : ctx.lazyBitcodeFiles)
+    bufs.insert(file->mb.getBufferStart());
+  for (MemoryBuffer &mb : llvm::make_pointee_range(ctx.memoryBuffers))
+    if (bufs.count(mb.getBufferStart()))
+      mb.dontNeedIfMmap();
+}
+
+// This function is where all the optimizations of link-time
+// optimization takes place. When LTO is in use, some input files are
+// not in native object file format but in the LLVM bitcode format.
+// This function compiles bitcode files into a few big native files
+// using LLVM functions and replaces bitcode symbols with the results.
+// Because all bitcode files that the program consists of are passed to
+// the compiler at once, it can do a whole-program optimization.
+template <class ELFT>
+void LinkerDriver::compileBitcodeFiles(bool skipLinkedOutput) {
+  llvm::TimeTraceScope timeScope("LTO");
+  // Compile bitcode files and replace bitcode symbols.
+  lto.reset(new BitcodeCompiler);
+  for (BitcodeFile *file : ctx.bitcodeFiles)
+    lto->add(*file);
+
+  if (!ctx.bitcodeFiles.empty())
+    markBuffersAsDontNeed(skipLinkedOutput);
+
+  for (InputFile *file : lto->compile()) {
+    auto *obj = cast<ObjFile<ELFT>>(file);
+    obj->parse(/*ignoreComdats=*/true);
+
+    // Parse '@' in symbol names for non-relocatable output.
+    if (!config->relocatable)
+      for (Symbol *sym : obj->getGlobalSymbols())
+        if (sym->hasVersionSuffix)
+          sym->parseSymbolVersion();
+    ctx.objectFiles.push_back(obj);
+  }
+}
+
+// The --wrap option is a feature to rename symbols so that you can write
+// wrappers for existing functions. If you pass `--wrap=foo`, all
+// occurrences of symbol `foo` are resolved to `__wrap_foo` (so, you are
+// expected to write `__wrap_foo` function as a wrapper). The original
+// symbol becomes accessible as `__real_foo`, so you can call that from your
+// wrapper.
+//
+// This data structure is instantiated for each --wrap option.
+struct WrappedSymbol {
+  Symbol *sym;
+  Symbol *real;
+  Symbol *wrap;
+};
+
+// Handles --wrap option.
+//
+// This function instantiates wrapper symbols. At this point, they seem
+// like they are not being used at all, so we explicitly set some flags so
+// that LTO won't eliminate them.
+static std::vector<WrappedSymbol> addWrappedSymbols(opt::InputArgList &args) {
+  std::vector<WrappedSymbol> v;
+  DenseSet<StringRef> seen;
+
+  for (auto *arg : args.filtered(OPT_wrap)) {
+    StringRef name = arg->getValue();
+    if (!seen.insert(name).second)
+      continue;
+
+    Symbol *sym = symtab.find(name);
+    if (!sym)
+      continue;
+
+    Symbol *wrap =
+        addUnusedUndefined(saver().save("__wrap_" + name), sym->binding);
+
+    // If __real_ is referenced, pull in the symbol if it is lazy. Do this after
+    // processing __wrap_ as that may have referenced __real_.
+    StringRef realName = saver().save("__real_" + name);
+    if (symtab.find(realName))
+      addUnusedUndefined(name, sym->binding);
+
+    Symbol *real = addUnusedUndefined(realName);
+    v.push_back({sym, real, wrap});
+
+    // We want to tell LTO not to inline symbols to be overwritten
+    // because LTO doesn't know the final symbol contents after renaming.
+    real->scriptDefined = true;
+    sym->scriptDefined = true;
+
+    // If a symbol is referenced in any object file, bitcode file or shared
+    // object, mark its redirection target (foo for __real_foo and __wrap_foo
+    // for foo) as referenced after redirection, which will be used to tell LTO
+    // to not eliminate the redirection target. If the object file defining the
+    // symbol also references it, we cannot easily distinguish the case from
+    // cases where the symbol is not referenced. Retain the redirection target
+    // in this case because we choose to wrap symbol references regardless of
+    // whether the symbol is defined
+    // (https://sourceware.org/bugzilla/show_bug.cgi?id=26358).
+    if (real->referenced || real->isDefined())
+      sym->referencedAfterWrap = true;
+    if (sym->referenced || sym->isDefined())
+      wrap->referencedAfterWrap = true;
+  }
+  return v;
+}
+
+static void combineVersionedSymbol(Symbol &sym,
+                                   DenseMap<Symbol *, Symbol *> &map) {
+  const char *suffix1 = sym.getVersionSuffix();
+  if (suffix1[0] != '@' || suffix1[1] == '@')
+    return;
+
+  // Check the existing symbol foo. We have two special cases to handle:
+  //
+  // * There is a definition of foo@v1 and foo@@v1.
+  // * There is a definition of foo@v1 and foo.
+  Defined *sym2 = dyn_cast_or_null<Defined>(symtab.find(sym.getName()));
+  if (!sym2)
+    return;
+  const char *suffix2 = sym2->getVersionSuffix();
+  if (suffix2[0] == '@' && suffix2[1] == '@' &&
+      strcmp(suffix1 + 1, suffix2 + 2) == 0) {
+    // foo@v1 and foo@@v1 should be merged, so redirect foo@v1 to foo@@v1.
+    map.try_emplace(&sym, sym2);
+    // If both foo@v1 and foo@@v1 are defined and non-weak, report a
+    // duplicate definition error.
+    if (sym.isDefined()) {
+      sym2->checkDuplicate(cast<Defined>(sym));
+      sym2->resolve(cast<Defined>(sym));
+    } else if (sym.isUndefined()) {
+      sym2->resolve(cast<Undefined>(sym));
+    } else {
+      sym2->resolve(cast<SharedSymbol>(sym));
+    }
+    // Eliminate foo@v1 from the symbol table.
+    sym.symbolKind = Symbol::PlaceholderKind;
+    sym.isUsedInRegularObj = false;
+  } else if (auto *sym1 = dyn_cast<Defined>(&sym)) {
+    if (sym2->versionId > VER_NDX_GLOBAL
+            ? config->versionDefinitions[sym2->versionId].name == suffix1 + 1
+            : sym1->section == sym2->section && sym1->value == sym2->value) {
+      // Due to an assembler design flaw, if foo is defined, .symver foo,
+      // foo@v1 defines both foo and foo@v1. Unless foo is bound to a
+      // different version, GNU ld makes foo@v1 canonical and eliminates
+      // foo. Emulate its behavior, otherwise we would have foo or foo@@v1
+      // beside foo@v1. foo@v1 and foo combining does not apply if they are
+      // not defined in the same place.
+      map.try_emplace(sym2, &sym);
+      sym2->symbolKind = Symbol::PlaceholderKind;
+      sym2->isUsedInRegularObj = false;
+    }
+  }
+}
+
+// Do renaming for --wrap and foo@v1 by updating pointers to symbols.
+//
+// When this function is executed, only InputFiles and symbol table
+// contain pointers to symbol objects. We visit them to replace pointers,
+// so that wrapped symbols are swapped as instructed by the command line.
+static void redirectSymbols(ArrayRef<WrappedSymbol> wrapped) {
+  llvm::TimeTraceScope timeScope("Redirect symbols");
+  DenseMap<Symbol *, Symbol *> map;
+  for (const WrappedSymbol &w : wrapped) {
+    map[w.sym] = w.wrap;
+    map[w.real] = w.sym;
+  }
+
+  // If there are version definitions (versionDefinitions.size() > 2), enumerate
+  // symbols with a non-default version (foo@v1) and check whether it should be
+  // combined with foo or foo@@v1.
+  if (config->versionDefinitions.size() > 2)
+    for (Symbol *sym : symtab.getSymbols())
+      if (sym->hasVersionSuffix)
+        combineVersionedSymbol(*sym, map);
+
+  if (map.empty())
+    return;
+
+  // Update pointers in input files.
+  parallelForEach(ctx.objectFiles, [&](ELFFileBase *file) {
+    for (Symbol *&sym : file->getMutableGlobalSymbols())
+      if (Symbol *s = map.lookup(sym))
+        sym = s;
+  });
+
+  // Update pointers in the symbol table.
+  for (const WrappedSymbol &w : wrapped)
+    symtab.wrap(w.sym, w.real, w.wrap);
+}
+
+static void checkAndReportMissingFeature(StringRef config, uint32_t features,
+                                         uint32_t mask, const Twine &report) {
+  if (!(features & mask)) {
+    if (config == "error")
+      error(report);
+    else if (config == "warning")
+      warn(report);
+  }
+}
+
+// To enable CET (x86's hardware-assisted control flow enforcement), each
+// source file must be compiled with -fcf-protection. Object files compiled
+// with the flag contain feature flags indicating that they are compatible
+// with CET. We enable the feature only when all object files are compatible
+// with CET.
+//
+// This is also the case with AARCH64's BTI and PAC which use the similar
+// GNU_PROPERTY_AARCH64_FEATURE_1_AND mechanism.
+static uint32_t getAndFeatures() {
+  if (config->emachine != EM_386 && config->emachine != EM_X86_64 &&
+      config->emachine != EM_AARCH64)
+    return 0;
+
+  uint32_t ret = -1;
+  for (ELFFileBase *f : ctx.objectFiles) {
+    uint32_t features = f->andFeatures;
+
+    checkAndReportMissingFeature(
+        config->zBtiReport, features, GNU_PROPERTY_AARCH64_FEATURE_1_BTI,
+        toString(f) + ": -z bti-report: file does not have "
+                      "GNU_PROPERTY_AARCH64_FEATURE_1_BTI property");
+
+    checkAndReportMissingFeature(
+        config->zCetReport, features, GNU_PROPERTY_X86_FEATURE_1_IBT,
+        toString(f) + ": -z cet-report: file does not have "
+                      "GNU_PROPERTY_X86_FEATURE_1_IBT property");
+
+    checkAndReportMissingFeature(
+        config->zCetReport, features, GNU_PROPERTY_X86_FEATURE_1_SHSTK,
+        toString(f) + ": -z cet-report: file does not have "
+                      "GNU_PROPERTY_X86_FEATURE_1_SHSTK property");
+
+    if (config->zForceBti && !(features & GNU_PROPERTY_AARCH64_FEATURE_1_BTI)) {
+      features |= GNU_PROPERTY_AARCH64_FEATURE_1_BTI;
+      if (config->zBtiReport == "none")
+        warn(toString(f) + ": -z force-bti: file does not have "
+                           "GNU_PROPERTY_AARCH64_FEATURE_1_BTI property");
+    } else if (config->zForceIbt &&
+               !(features & GNU_PROPERTY_X86_FEATURE_1_IBT)) {
+      if (config->zCetReport == "none")
+        warn(toString(f) + ": -z force-ibt: file does not have "
+                           "GNU_PROPERTY_X86_FEATURE_1_IBT property");
+      features |= GNU_PROPERTY_X86_FEATURE_1_IBT;
+    }
+    if (config->zPacPlt && !(features & GNU_PROPERTY_AARCH64_FEATURE_1_PAC)) {
+      warn(toString(f) + ": -z pac-plt: file does not have "
+                         "GNU_PROPERTY_AARCH64_FEATURE_1_PAC property");
+      features |= GNU_PROPERTY_AARCH64_FEATURE_1_PAC;
+    }
+    ret &= features;
+  }
+
+  // Force enable Shadow Stack.
+  if (config->zShstk)
+    ret |= GNU_PROPERTY_X86_FEATURE_1_SHSTK;
+
+  return ret;
+}
+
+static void initSectionsAndLocalSyms(ELFFileBase *file, bool ignoreComdats) {
+  switch (file->ekind) {
+  case ELF32LEKind:
+    cast<ObjFile<ELF32LE>>(file)->initSectionsAndLocalSyms(ignoreComdats);
+    break;
+  case ELF32BEKind:
+    cast<ObjFile<ELF32BE>>(file)->initSectionsAndLocalSyms(ignoreComdats);
+    break;
+  case ELF64LEKind:
+    cast<ObjFile<ELF64LE>>(file)->initSectionsAndLocalSyms(ignoreComdats);
+    break;
+  case ELF64BEKind:
+    cast<ObjFile<ELF64BE>>(file)->initSectionsAndLocalSyms(ignoreComdats);
+    break;
+  default:
+    llvm_unreachable("");
+  }
+}
+
+static void postParseObjectFile(ELFFileBase *file) {
+  switch (file->ekind) {
+  case ELF32LEKind:
+    cast<ObjFile<ELF32LE>>(file)->postParse();
+    break;
+  case ELF32BEKind:
+    cast<ObjFile<ELF32BE>>(file)->postParse();
+    break;
+  case ELF64LEKind:
+    cast<ObjFile<ELF64LE>>(file)->postParse();
+    break;
+  case ELF64BEKind:
+    cast<ObjFile<ELF64BE>>(file)->postParse();
+    break;
+  default:
+    llvm_unreachable("");
+  }
+}
+#ifdef TOOLCHAIN_INSTALL_PATH
+static const std::string ToolChain = TOOLCHAIN_INSTALL_PATH;
+#endif
+
+#ifdef LLD_RISCV_PACKER
+#ifdef TOOLCHAIN_INSTALL_PATH
+static const std::string PackerDir = LLD_RISCV_PACKER;
+
+
+// For qemu status decode
+#include <sys/wait.h>
+#include <ctime>
+
+// Helper: timestamp string YYYYMMDD_HHMMSS for filenames
+static std::string nowTimestamp() {
+  char buf[32];
+  std::time_t t = std::time(nullptr);
+  std::tm tmv{};
+  localtime_r(&t, &tmv);
+  std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tmv);
+  return std::string(buf);
+}
+
+// Helper: save failing ELF and qemu output for post-mortem
+static void saveFailureArtifacts(const std::string &elfPath,
+                                 const char *ctx,
+                                 const char *offsetLbl,
+                                 const std::string &qemuOutput,
+                                 int exitCode) {
+  auto q = [](const std::string &s) { return '"' + s + '"'; };
+  const std::string dir = "failed_bins";
+  // mkdir -p failed_bins
+  std::string mk = std::string("mkdir -p ") + q(dir);
+  (void)std::system(mk.c_str());
+
+  // compose base name
+  std::string ts = nowTimestamp();
+  std::string ctxs = ctx ? ctx : "-";
+  std::string ofs  = offsetLbl ? offsetLbl : "-";
+  for (char &c : ctxs) if (c == ' ') c = '_';
+  for (char &c : ofs)  if (c == ' ') c = '_';
+  std::string base = dir + "/" + ts + "-" + ctxs + "-" + ofs;
+
+  // copy ELF
+  std::string dstElf = base + ".elf";
+  std::string cp = std::string("cp ") + q(elfPath) + " " + q(dstElf);
+  (void)std::system(cp.c_str());
+
+  // write log
+  std::string dstLog = base + ".log";
+  FILE *f = std::fopen(dstLog.c_str(), "wb");
+  if (f) {
+    std::fprintf(f, "[EXIT-CODE] %d\n", exitCode);
+    std::fwrite(qemuOutput.data(), 1, qemuOutput.size(), f);
+    std::fclose(f);
+  }
+  std::printf("[KEEP] saved failure artifacts: %s (.elf/.log)\n", base.c_str());
+}
+
+// Helper: extract hex checksum (uppercase) from a line like "checksum = 51CB0F9A"
+static bool extractChecksumHex(const std::string &line, std::string &hexOut) {
+  size_t pos = line.find('=');
+  std::string rhs = (pos == std::string::npos) ? line : line.substr(pos + 1);
+  std::string hex;
+  hex.reserve(rhs.size());
+  for (unsigned char ch : rhs) {
+    if (std::isxdigit(ch)) hex.push_back(static_cast<char>(std::toupper(ch)));
+  }
+  if (hex.empty()) return false;
+  hexOut = hex;
+  return true;
+}
+
+struct QemuRunResult {
+  int exitCode = -1;
+  std::string output;
+  std::string checksum;
+  bool hasChecksum = false;
+};
+
+static bool runQemuCaptureCtx(const std::string &elfPath, const char *ctx,
+                              const char *offsetLbl, QemuRunResult &result,
+                              bool dumpOutput = true,
+                              const std::string &tracePath = "") {
+  auto q = [](const std::string &s) { return '"' + s + '"'; };
+  const std::string qemu = "qemu-riscv32";
+  if (!tracePath.empty())
+    ::unlink(tracePath.c_str());
+  const std::string traceArgs =
+      tracePath.empty() ? "" : " -d exec -D " + q(tracePath);
+  const std::string runCmd = std::string("timeout -s KILL 90s ") + q(qemu) +
+                             " -B 0x10000000" + traceArgs + " " + q(elfPath) +
+                             " </dev/null 2>&1";
+
+  std::printf("[QEMU-CMD@%s/%s] %s\n", ctx ? ctx : "-",
+              offsetLbl ? offsetLbl : "-", runCmd.c_str());
+
+  FILE *pipe = popen(runCmd.c_str(), "r");
+  if (!pipe) {
+    std::fprintf(stderr,
+                 "[ERROR] popen failed when starting qemu (%s/%s).\n",
+                 ctx ? ctx : "-", offsetLbl ? offsetLbl : "-");
+    return false;
+  }
+
+  result = QemuRunResult();
+  char buf[4096];
+  while (fgets(buf, sizeof(buf), pipe))
+    result.output.append(buf);
+
+  int status = pclose(pipe);
+  if (status != -1) {
+    if (WIFEXITED(status))
+      result.exitCode = WEXITSTATUS(status);
+    else if (WIFSIGNALED(status))
+      result.exitCode = 128 + WTERMSIG(status);
+  }
+  std::printf("[QEMU-STATUS@%s/%s] raw_status=%d code=%d\n",
+              ctx ? ctx : "-", offsetLbl ? offsetLbl : "-", status,
+              result.exitCode);
+
+  if (dumpOutput) {
+    std::printf("----- QEMU OUTPUT BEGIN [%s/%s] -----\n", ctx ? ctx : "-",
+                offsetLbl ? offsetLbl : "-");
+    if (!result.output.empty())
+      std::fwrite(result.output.data(), 1, result.output.size(), stdout);
+    if (result.output.empty() || result.output.back() != '\n')
+      std::printf("\n");
+    std::printf("----- QEMU OUTPUT END [%s/%s] -----\n", ctx ? ctx : "-",
+                offsetLbl ? offsetLbl : "-");
+  }
+
+  if (result.exitCode != 0)
+    saveFailureArtifacts(elfPath, ctx, offsetLbl, result.output,
+                         result.exitCode);
+
+  std::istringstream iss(result.output);
+  std::string line;
+  while (std::getline(iss, line)) {
+    std::string lower = line;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    if (lower.find("checksum") != std::string::npos) {
+      if (extractChecksumHex(line, result.checksum)) {
+        result.hasChecksum = true;
+        std::printf("[QEMU-CHECKSUM@%s/%s] %s\n", ctx ? ctx : "-",
+                    offsetLbl ? offsetLbl : "-", result.checksum.c_str());
+        break;
+      }
+    }
+  }
+
+  if (!result.hasChecksum)
+    std::printf("[QEMU-CHECKSUM@%s/%s] <not found>\n", ctx ? ctx : "-",
+                offsetLbl ? offsetLbl : "-");
+  return true;
+}
+
+static bool qemuRunMatchesBaseline(const QemuRunResult &candidate,
+                                   const QemuRunResult &baseline) {
+  if (baseline.exitCode != 0 || candidate.exitCode != 0)
+    return false;
+  if (baseline.hasChecksum || candidate.hasChecksum)
+    return baseline.hasChecksum && candidate.hasChecksum &&
+           baseline.checksum == candidate.checksum;
+  return candidate.output == baseline.output;
+}
+
+// Helper: run qemu-riscv32 on an ELF and capture the first line containing "checksum"; returns the hex value
+static bool runQemuAndGetChecksumCtx(const std::string &elfPath, const char *ctx, const char *offsetLbl, std::string &hexOut) {
+  auto q = [](const std::string &s) { return '"' + s + '"'; };
+  const std::string qemu = "qemu-riscv32";
+  const std::string runCmd = std::string("timeout -s KILL 90s ") + q(qemu) +
+                             " -B 0x10000000 " + q(elfPath) +
+                             " </dev/null 2>&1";
+
+  std::printf("[QEMU-CMD@%s/%s] %s\n", ctx ? ctx : "-", offsetLbl ? offsetLbl : "-", runCmd.c_str());
+
+  FILE *pipe = popen(runCmd.c_str(), "r");
+  if (!pipe) {
+    std::fprintf(stderr, "[ERROR] popen failed when starting qemu (%s/%s).\n", ctx ? ctx : "-", offsetLbl ? offsetLbl : "-");
+    return false;
+  }
+
+  std::string out;
+  char buf[4096];
+  while (fgets(buf, sizeof(buf), pipe)) out.append(buf);
+
+  int status = pclose(pipe);
+  int code = -1;
+  if (status != -1) {
+    if (WIFEXITED(status)) code = WEXITSTATUS(status);
+    else if (WIFSIGNALED(status)) code = 128 + WTERMSIG(status);
+  }
+  std::printf("[QEMU-STATUS@%s/%s] raw_status=%d code=%d\n", ctx ? ctx : "-", offsetLbl ? offsetLbl : "-", status, code);
+
+  // Dump combined stdout/stderr to help debugging differences between runs
+  std::printf("----- QEMU OUTPUT BEGIN [%s/%s] -----\n", ctx ? ctx : "-", offsetLbl ? offsetLbl : "-");
+  if (!out.empty()) std::fwrite(out.data(), 1, out.size(), stdout);
+  if (out.empty() || out.back() != '\n') std::printf("\n");
+  std::printf("----- QEMU OUTPUT END [%s/%s] -----\n", ctx ? ctx : "-", offsetLbl ? offsetLbl : "-");
+
+  // Preserve artifacts if qemu failed (non-zero code)
+  if (code != 0) {
+    saveFailureArtifacts(elfPath, ctx, offsetLbl, out, code);
+  }
+
+  if (code == 124) {
+    std::fprintf(stderr, "[WARN] qemu timed out after 90s for %s (%s/%s)\n", elfPath.c_str(), ctx ? ctx : "-", offsetLbl ? offsetLbl : "-");
+  } else if (code > 0) {
+    std::fprintf(stderr, "[WARN] qemu exited with code %d for %s (%s/%s).\n", code, elfPath.c_str(), ctx ? ctx : "-", offsetLbl ? offsetLbl : "-");
+  }
+
+  std::istringstream iss(out);
+  std::string line;
+  while (std::getline(iss, line)) {
+    std::string lower = line;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    if (lower.find("checksum") != std::string::npos) {
+      std::string hex;
+      if (extractChecksumHex(line, hex)) {
+        hexOut = hex;
+        std::printf("[QEMU-CHECKSUM@%s/%s] %s\n", ctx ? ctx : "-", offsetLbl ? offsetLbl : "-", hex.c_str());
+        return true;
+      }
+    }
+  }
+  // No checksum found: keep artifacts as well
+  saveFailureArtifacts(elfPath, ctx, offsetLbl, out, code);
+  std::printf("[QEMU-CHECKSUM@%s/%s] <not found>\n", ctx ? ctx : "-", offsetLbl ? offsetLbl : "-");
+  return false;
+}
+
+static bool waitForFile(const std::string &path, int maxTry = 10) {
+  for (int i = 0; i < maxTry; ++i) {
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0 && st.st_size > 0)
+      return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  return false;
+}
+
+static std::string quoteArg(const std::string &s) { return '"' + s + '"'; }
+
+static std::string baseNameOf(const std::string &p) {
+  size_t pos = p.find_last_of("/\\");
+  return (pos == std::string::npos) ? p : p.substr(pos + 1);
+}
+
+static std::string sanitizePathTag(std::string s) {
+  for (char &c : s)
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '_' &&
+        c != '-')
+      c = '_';
+  return s;
+}
+
+static long fileSizeOf(const std::string &path) {
+  struct stat st {};
+  if (::stat(path.c_str(), &st) != 0)
+    return -1;
+  return static_cast<long>(st.st_size);
+}
+
+static bool copyFileForCandidate(const std::string &from,
+                                 const std::string &to) {
+  std::string cmd = "cp " + quoteArg(from) + " " + quoteArg(to);
+  return std::system(cmd.c_str()) == 0 && fileSizeOf(to) > 0;
+}
+
+// Build a profile-specialized compression candidate by turning code bytes that
+// qemu never translated for this run into C.NOP. The candidate is still accepted
+// only after the normal full-output/checksum validation.
+static bool runQemuInAsmTrace(const std::string &elfPath,
+                              const std::string &tracePath) {
+  ::unlink(tracePath.c_str());
+  std::string cmd = "timeout -s KILL 90s \"qemu-riscv32\" -B 0x10000000 "
+                    "-d in_asm,exec -D " +
+                    quoteArg(tracePath) + " " + quoteArg(elfPath) +
+                    " </dev/null >/dev/null 2>&1";
+  int status = std::system(cmd.c_str());
+  int code = -1;
+  if (status != -1) {
+    if (WIFEXITED(status))
+      code = WEXITSTATUS(status);
+    else if (WIFSIGNALED(status))
+      code = 128 + WTERMSIG(status);
+  }
+  if (code != 0 || fileSizeOf(tracePath) <= 0) {
+    std::fprintf(stderr, "[NOPLIZE] failed to collect in_asm trace for %s "
+                         "(code=%d)\n",
+                 elfPath.c_str(), code);
+    ::unlink(tracePath.c_str());
+    return false;
+  }
+  std::printf("[NOPLIZE] collected in_asm trace: %s\n", tracePath.c_str());
+  return true;
+}
+
+struct RiscvExecSection {
+  uint32_t addr = 0;
+  uint32_t size = 0;
+  uint32_t offset = 0;
+};
+
+struct RiscvInsnRange {
+  uint32_t addr = 0;
+  uint32_t size = 0;
+};
+
+static bool readBinaryFileForPatch(const std::string &path,
+                                   std::vector<unsigned char> &data) {
+  FILE *f = std::fopen(path.c_str(), "rb");
+  if (!f)
+    return false;
+  if (std::fseek(f, 0, SEEK_END) != 0) {
+    std::fclose(f);
+    return false;
+  }
+  long len = std::ftell(f);
+  if (len <= 0) {
+    std::fclose(f);
+    return false;
+  }
+  std::rewind(f);
+  data.resize(static_cast<size_t>(len));
+  bool ok = std::fread(data.data(), 1, data.size(), f) == data.size();
+  std::fclose(f);
+  return ok;
+}
+
+static bool writeBinaryFileForPatch(const std::string &path,
+                                    const std::vector<unsigned char> &data,
+                                    mode_t mode) {
+  FILE *f = std::fopen(path.c_str(), "wb");
+  if (!f)
+    return false;
+  bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+  if (std::fclose(f) != 0)
+    ok = false;
+  if (ok)
+    (void)::chmod(path.c_str(), mode & 07777);
+  return ok;
+}
+
+static bool readRiscvExecSections(ArrayRef<unsigned char> data,
+                                  std::vector<RiscvExecSection> &sections) {
+  if (data.size() < sizeof(Elf32_Ehdr))
+    return false;
+  const auto *eh = reinterpret_cast<const Elf32_Ehdr *>(data.data());
+  if (eh->e_ident[EI_MAG0] != 0x7f || eh->e_ident[EI_MAG1] != 'E' ||
+      eh->e_ident[EI_MAG2] != 'L' || eh->e_ident[EI_MAG3] != 'F' ||
+      eh->e_ident[EI_CLASS] != ELFCLASS32 ||
+      eh->e_ident[EI_DATA] != ELFDATA2LSB || eh->e_machine != EM_RISCV ||
+      eh->e_shentsize != sizeof(Elf32_Shdr) || eh->e_shoff == 0 ||
+      eh->e_shnum == 0)
+    return false;
+
+  uint64_t shEnd =
+      uint64_t(eh->e_shoff) + uint64_t(eh->e_shnum) * eh->e_shentsize;
+  if (shEnd > data.size())
+    return false;
+
+  for (unsigned i = 0; i != eh->e_shnum; ++i) {
+    const auto *sh = reinterpret_cast<const Elf32_Shdr *>(
+        data.data() + eh->e_shoff + i * eh->e_shentsize);
+    if (sh->sh_type != SHT_PROGBITS || !(sh->sh_flags & SHF_ALLOC) ||
+        !(sh->sh_flags & SHF_EXECINSTR) || sh->sh_size == 0)
+      continue;
+    if (uint64_t(sh->sh_offset) + sh->sh_size > data.size())
+      return false;
+    sections.push_back({sh->sh_addr, sh->sh_size, sh->sh_offset});
+  }
+
+  llvm::sort(sections, [](const RiscvExecSection &a,
+                          const RiscvExecSection &b) {
+    return a.addr < b.addr;
+  });
+  return !sections.empty();
+}
+
+static bool addressInExecSections(uint32_t addr,
+                                  ArrayRef<RiscvExecSection> sections) {
+  for (const RiscvExecSection &sec : sections)
+    if (addr >= sec.addr && addr < sec.addr + sec.size)
+      return true;
+  return false;
+}
+
+static bool vaToFileOffset(uint32_t addr, ArrayRef<RiscvExecSection> sections,
+                           uint32_t &offset) {
+  for (const RiscvExecSection &sec : sections) {
+    if (addr < sec.addr || addr >= sec.addr + sec.size)
+      continue;
+    offset = sec.offset + (addr - sec.addr);
+    return true;
+  }
+  return false;
+}
+
+static bool parseTraceInsnAddress(StringRef line, uint32_t &addr) {
+  line = line.trim();
+  if (!line.consume_front("0x") && !line.consume_front("0X"))
+    return false;
+  size_t end = 0;
+  while (end < line.size() &&
+         std::isxdigit(static_cast<unsigned char>(line[end])))
+    ++end;
+  if (end == 0 || end > 8 || end >= line.size() || line[end] != ':')
+    return false;
+  uint64_t value = 0;
+  if (line.take_front(end).getAsInteger(16, value) || value > UINT32_MAX)
+    return false;
+  addr = static_cast<uint32_t>(value);
+  return true;
+}
+
+static bool collectExecutedInsnAddresses(const std::string &tracePath,
+                                         ArrayRef<RiscvExecSection> sections,
+                                         std::vector<uint32_t> &executed) {
+  std::ifstream in(tracePath);
+  if (!in)
+    return false;
+
+  std::string line;
+  while (std::getline(in, line)) {
+    uint32_t addr = 0;
+    if (parseTraceInsnAddress(line, addr) &&
+        addressInExecSections(addr, sections))
+      executed.push_back(addr);
+  }
+
+  llvm::sort(executed);
+  executed.erase(std::unique(executed.begin(), executed.end()), executed.end());
+  return !executed.empty();
+}
+
+static void collectRiscvInstructions(ArrayRef<unsigned char> data,
+                                     ArrayRef<RiscvExecSection> sections,
+                                     std::vector<RiscvInsnRange> &insns) {
+  for (const RiscvExecSection &sec : sections) {
+    uint32_t off = sec.offset;
+    uint32_t addr = sec.addr;
+    uint32_t end = sec.offset + sec.size;
+    while (off + 2 <= end) {
+      uint16_t half = data[off] | (uint16_t(data[off + 1]) << 8);
+      uint32_t size = (half & 0x3) == 0x3 ? 4 : 2;
+      if (off + size > end)
+        break;
+      insns.push_back({addr, size});
+      off += size;
+      addr += size;
+    }
+  }
+  llvm::sort(insns, [](const RiscvInsnRange &a, const RiscvInsnRange &b) {
+    return a.addr < b.addr;
+  });
+}
+
+static uint64_t patchUnexecutedSpanWithCNop(std::vector<unsigned char> &data,
+                                            ArrayRef<RiscvExecSection> sections,
+                                            uint32_t start, uint32_t end,
+                                            bool aggressive) {
+  if (end <= start || (!aggressive && end - start < 8))
+    return 0;
+
+  const uint32_t patchStart = aggressive ? start : start + 4;
+  const uint32_t patchEnd = aggressive ? end : end - 4;
+  uint64_t patched = 0;
+  for (uint32_t addr = patchStart; addr + 2 <= patchEnd; addr += 2) {
+    uint32_t off = 0;
+    if (!vaToFileOffset(addr, sections, off) || uint64_t(off) + 2 > data.size())
+      continue;
+    data[off] = 0x01;
+    data[off + 1] = 0x00;
+    patched += 2;
+  }
+  return patched;
+}
+
+static bool makeRiscvNoplizedCandidate(const std::string &inputPath,
+                                       const std::string &tracePath,
+                                       const std::string &outputPath,
+                                       bool aggressive = false) {
+  std::vector<unsigned char> data;
+  if (!readBinaryFileForPatch(inputPath, data))
+    return false;
+
+  std::vector<RiscvExecSection> sections;
+  if (!readRiscvExecSections(data, sections))
+    return false;
+
+  std::vector<uint32_t> executed;
+  if (!collectExecutedInsnAddresses(tracePath, sections, executed))
+    return false;
+
+  std::vector<RiscvInsnRange> insns;
+  collectRiscvInstructions(data, sections, insns);
+  if (insns.empty())
+    return false;
+
+  uint64_t patched = 0;
+  bool inSpan = false;
+  uint32_t spanStart = 0;
+  uint32_t spanEnd = 0;
+  auto flushSpan = [&]() {
+    if (!inSpan)
+      return;
+    patched +=
+        patchUnexecutedSpanWithCNop(data, sections, spanStart, spanEnd,
+                                    aggressive);
+    inSpan = false;
+  };
+
+  for (const RiscvInsnRange &insn : insns) {
+    bool isExecuted =
+        std::binary_search(executed.begin(), executed.end(), insn.addr);
+    if (!isExecuted) {
+      if (!inSpan) {
+        inSpan = true;
+        spanStart = insn.addr;
+      }
+      spanEnd = insn.addr + insn.size;
+      continue;
+    }
+    flushSpan();
+  }
+  flushSpan();
+
+  if (patched == 0)
+    return false;
+
+  struct stat st {};
+  mode_t mode = 0755;
+  if (::stat(inputPath.c_str(), &st) == 0)
+    mode = st.st_mode;
+
+  if (!writeBinaryFileForPatch(outputPath, data, mode))
+    return false;
+
+  std::printf("[NOPLIZE] patched %llu unexecuted bytes%s: %s -> %s\n",
+              static_cast<unsigned long long>(patched),
+              aggressive ? " (aggressive)" : "", inputPath.c_str(),
+              outputPath.c_str());
+  return true;
+}
+
+class ScopedEnvVar {
+public:
+  ScopedEnvVar(const char *name, const char *value) : name(name) {
+    if (const char *oldValue = std::getenv(name)) {
+      hadOldValue = true;
+      old = oldValue;
+    }
+    ::setenv(name, value, 1);
+  }
+
+  ~ScopedEnvVar() {
+    if (hadOldValue)
+      ::setenv(name, old.c_str(), 1);
+    else
+      ::unsetenv(name);
+  }
+
+private:
+  const char *name;
+  bool hadOldValue = false;
+  std::string old;
+};
+
+static bool makeTempDir(std::string &dir) {
+  std::string templ =
+      "/tmp/bisheng-packer-" + std::to_string(static_cast<long>(::getpid())) +
+      "-XXXXXX";
+  std::vector<char> buf(templ.begin(), templ.end());
+  buf.push_back('\0');
+  char *res = ::mkdtemp(buf.data());
+  if (!res) {
+    std::fprintf(stderr, "[LEGACY-PACK] mkdtemp failed: %s\n",
+                 std::strerror(errno));
+    return false;
+  }
+  dir = res;
+  return true;
+}
+
+static bool packWithLegacyPacker(const std::string &payloadPath) {
+  ScopedEnvVar packing("RV_PACKING", "1");
+
+  auto exists = [](const std::string &p) {
+    return ::access(p.c_str(), F_OK) == 0;
+  };
+  auto chk = [&](const std::string &p, const char *desc) {
+    if (exists(p))
+      return true;
+    std::fprintf(stderr, "[LEGACY-PACK] missing %s: %s\n", desc, p.c_str());
+    return false;
+  };
+
+  struct stat inputStat {};
+  if (::stat(payloadPath.c_str(), &inputStat) != 0) {
+    std::fprintf(stderr, "[LEGACY-PACK] stat failed for %s: %s\n",
+                 payloadPath.c_str(), std::strerror(errno));
+    return false;
+  }
+
+  const std::string clang = ToolChain + "/clang";
+  const std::string strip = ToolChain + "/llvm-strip";
+  const std::string objcopy = ToolChain + "/llvm-objcopy";
+
+  const std::string py = "python3";
+
+  const std::string ld = PackerDir + "/src/linker.ld";
+  const std::string loaderLd = PackerDir + "/src/linkerhigh.ld";
+  const std::string stubC = PackerDir + "/src/stub_min.c";
+  const std::string loader = PackerDir + "/src/loader.c";
+  const std::string packPy = PackerDir + "/pack.py";
+
+  if (!chk(clang, "clang") || !chk(strip, "llvm-strip") ||
+      !chk(objcopy, "llvm-objcopy") || !chk(ld, "linker.ld") ||
+      !chk(loaderLd, "linkerhigh.ld") || !chk(stubC, "stub_min.c") ||
+      !chk(loader, "loader.c") || !chk(packPy, "pack.py"))
+    return false;
+
+  std::string workDir;
+  if (!makeTempDir(workDir))
+    return false;
+  const std::string outDir = workDir + "/out";
+  const std::string payDir = workDir + "/payloads";
+  std::string cmd = "mkdir -p " + quoteArg(outDir) + " " + quoteArg(payDir);
+  if (std::system(cmd.c_str()) != 0) {
+    std::fprintf(stderr, "[LEGACY-PACK] failed to create %s\n",
+                 workDir.c_str());
+    return false;
+  }
+
+  const std::string stubElf = outDir + "/stub.elf";
+  const std::string stubLog = outDir + "/stub.log";
+  cmd = quoteArg(clang) +
+        " --target=riscv32 -mabi=ilp32d -Os -ffreestanding -nostdlib"
+        " -fno-pie -fno-pic"
+        " -Wl,--no-gc-sections,-T," +
+        quoteArg(ld) + " -o " + quoteArg(stubElf) + " " + quoteArg(stubC) +
+        " > " + quoteArg(stubLog) + " 2>&1";
+  std::printf("[LEGACY-PACK] compiling stub: %s\n", cmd.c_str());
+  if (std::system(cmd.c_str()) != 0) {
+    std::fprintf(stderr, "[LEGACY-PACK] failed to compile stub, log=%s\n",
+                 stubLog.c_str());
+    return false;
+  }
+
+  const std::string copiedPayload = payDir + "/" + baseNameOf(payloadPath);
+  if (!copyFileForCandidate(payloadPath, copiedPayload)) {
+    std::fprintf(stderr, "[LEGACY-PACK] failed to copy payload %s\n",
+                 payloadPath.c_str());
+    return false;
+  }
+
+  const std::string packedElf = outDir + "/packed.elf";
+  const std::string packLog = outDir + "/pack.log";
+  cmd = quoteArg(py) + " " + quoteArg(packPy) + " " + quoteArg(stubElf) +
+        " " + quoteArg(copiedPayload) + " " + quoteArg(packedElf) + " > " +
+        quoteArg(packLog) + " 2>&1";
+  std::printf("[LEGACY-PACK] running pack.py: %s\n", cmd.c_str());
+  if (std::system(cmd.c_str()) != 0) {
+    std::fprintf(stderr, "[LEGACY-PACK] pack.py failed, log=%s\n",
+                 packLog.c_str());
+    return false;
+  }
+  if (!exists(outDir + "/hdr.c") || !exists(outDir + "/payload.c")) {
+    std::fprintf(stderr, "[LEGACY-PACK] pack.py output missing in %s\n",
+                 outDir.c_str());
+    return false;
+  }
+
+  const std::string finalLog = outDir + "/final.log";
+  cmd = quoteArg(clang) +
+        " --target=riscv32 -mabi=ilp32d -Oz -ffreestanding -nostdlib"
+        " -static -fno-pie -fno-pic"
+        " -Wl,--no-gc-sections,-T," +
+        quoteArg(loaderLd) + " " + quoteArg(loader) + " " +
+        quoteArg(outDir + "/hdr.c") + " " + quoteArg(outDir + "/payload.c") +
+        " -o " + quoteArg(payloadPath) + " > " + quoteArg(finalLog) +
+        " 2>&1";
+  std::printf("[LEGACY-PACK] compiling final ELF: %s\n", cmd.c_str());
+  if (std::system(cmd.c_str()) != 0) {
+    std::fprintf(stderr, "[LEGACY-PACK] final compile failed, log=%s\n",
+                 finalLog.c_str());
+    return false;
+  }
+
+  cmd = quoteArg(strip) + " --strip-unneeded " + quoteArg(payloadPath);
+  if (std::system(cmd.c_str()) != 0) {
+    std::fprintf(stderr, "[LEGACY-PACK] strip failed for %s\n",
+                 payloadPath.c_str());
+    return false;
+  }
+
+  cmd = quoteArg(objcopy) +
+        " --strip-all --strip-sections"
+        " --remove-section=.gnu.stack"
+        " --remove-section=.riscv.attributes"
+        " --remove-section=.note.gnu.build-id " +
+        quoteArg(payloadPath) + " > /dev/null 2>&1";
+  if (std::system(cmd.c_str()) != 0) {
+    std::fprintf(stderr, "[LEGACY-PACK] objcopy failed for %s\n",
+                 payloadPath.c_str());
+    return false;
+  }
+  if (::chmod(payloadPath.c_str(), inputStat.st_mode & 07777) != 0) {
+    std::fprintf(stderr, "[LEGACY-PACK] chmod failed for %s: %s\n",
+                 payloadPath.c_str(), std::strerror(errno));
+    return false;
+  }
+
+  std::printf("[LEGACY-PACK] packed %s -> %ld bytes\n", payloadPath.c_str(),
+              fileSizeOf(payloadPath));
+  return true;
+}
+
+struct PayloadCandidate {
+  std::string path;
+  std::string label;
+  long size = -1;
+};
+
+static bool addVerifiedPayloadCandidate(std::vector<PayloadCandidate> &cands,
+                                        const std::string &path,
+                                        const std::string &label,
+                                        const std::string &baselineHex,
+                                        const std::string &offsetLbl,
+                                        bool requireChecksum) {
+  long size = fileSizeOf(path);
+  if (size <= 0) {
+    std::fprintf(stderr, "[CANDIDATE] %s has invalid size: %s\n",
+                 label.c_str(), path.c_str());
+    return false;
+  }
+
+  if (requireChecksum) {
+    std::string hex;
+    if (!runQemuAndGetChecksumCtx(path, label.c_str(), offsetLbl.c_str(),
+                                  hex)) {
+      std::fprintf(stderr, "[CANDIDATE] %s rejected: no checksum\n",
+                   label.c_str());
+      return false;
+    }
+    if (hex != baselineHex) {
+      std::fprintf(stderr,
+                   "[CANDIDATE] %s rejected: checksum=%s baseline=%s\n",
+                   label.c_str(), hex.c_str(), baselineHex.c_str());
+      return false;
+    }
+  }
+
+  cands.push_back({path, label, size});
+  std::printf("[CANDIDATE] accepted %-12s size=%ld path=%s\n",
+              label.c_str(), size, path.c_str());
+  return true;
+}
+
+static bool selectBestPayloadCandidate(const std::string &inputPath,
+                                       const std::string &objPath,
+                                       const std::string &baselineHex,
+                                       const std::string &offsetLbl,
+                                       bool requireChecksum,
+                                       std::string &bestPath,
+                                       std::string &bestLabel) {
+  std::vector<PayloadCandidate> candidates;
+  addVerifiedPayloadCandidate(candidates, inputPath, "plain", baselineHex,
+                              offsetLbl, requireChecksum);
+
+  long inputSize = fileSizeOf(inputPath);
+  const std::string prefix =
+      objPath + ".cand." + sanitizePathTag(offsetLbl.empty() ? "none" : offsetLbl);
+
+  if (inputSize > 50000) {
+    const std::string legacyPath = prefix + ".legacy.tmp";
+    if (copyFileForCandidate(inputPath, legacyPath)) {
+      bool accepted = false;
+      if (packWithLegacyPacker(legacyPath))
+        accepted = addVerifiedPayloadCandidate(candidates, legacyPath, "legacy",
+                                               baselineHex, offsetLbl,
+                                               requireChecksum);
+      if (!accepted)
+        ::unlink(legacyPath.c_str());
+    }
+  } else {
+    std::printf("[CANDIDATE] skip legacy packer for small input size=%ld\n",
+                inputSize);
+  }
+
+  const std::string lz4Path = prefix + ".lz4.tmp";
+  if (copyFileForCandidate(inputPath, lz4Path)) {
+    bool accepted = false;
+    if (packWithLZ4(lz4Path))
+      accepted = addVerifiedPayloadCandidate(candidates, lz4Path, "lz4",
+                                             baselineHex, offsetLbl,
+                                             requireChecksum);
+    if (!accepted)
+      ::unlink(lz4Path.c_str());
+  }
+
+  if (candidates.empty()) {
+    std::fprintf(stderr, "[CANDIDATE] no valid payload candidates for %s\n",
+                 inputPath.c_str());
+    return false;
+  }
+
+  auto best = std::min_element(
+      candidates.begin(), candidates.end(),
+      [](const PayloadCandidate &a, const PayloadCandidate &b) {
+        return a.size < b.size;
+      });
+  bestPath = best->path;
+  bestLabel = best->label;
+  std::printf("[CANDIDATE] selected %-12s size=%ld path=%s\n",
+              bestLabel.c_str(), best->size, bestPath.c_str());
+
+  for (const PayloadCandidate &cand : candidates)
+    if (cand.path != bestPath)
+      ::unlink(cand.path.c_str());
+  return true;
+}
+
+static void runBoltAndPack(const std::string &objPath) {
+  auto q = [](const std::string &s) { return '"' + s + '"'; };
+
+  const std::string boltBin    = ToolChain + "/llvm-bolt";
+  const std::string objcopyBin = ToolChain + "/llvm-objcopy";
+  const std::string runtimeTrace = objPath + ".runtime.trace.txt";
+
+  // === BASELINE (before any mutation) ===
+  std::string baselineHexRaw;
+  QemuRunResult tracedBaseline;
+  bool tracedBaselineRan =
+      runQemuCaptureCtx(objPath, "BASELINE-TRACE", "-", tracedBaseline,
+                        /*dumpOutput=*/false, runtimeTrace);
+  bool haveRunnableBaseline = tracedBaselineRan && tracedBaseline.exitCode == 0;
+  bool haveRaw = haveRunnableBaseline && tracedBaseline.hasChecksum;
+  if (haveRaw) {
+    baselineHexRaw = tracedBaseline.checksum;
+    std::printf("[CHECKSUM-BASELINE-RAW] %s\n", baselineHexRaw.c_str());
+  } else if (!haveRunnableBaseline) {
+    ::unlink(runtimeTrace.c_str());
+    haveRaw = runQemuAndGetChecksumCtx(objPath, "BASELINE-RAW", "-",
+                                       baselineHexRaw);
+    if (haveRaw)
+      std::printf("[CHECKSUM-BASELINE-RAW] %s\n", baselineHexRaw.c_str());
+  } else {
+    std::printf("[INFO] Baseline has no checksum; keeping runtime trace and "
+                "using full-output validation.\n");
+  }
+
+  // 0) Save a pre-BOLT backup, then mutate objPath in-place to remove .riscv.attributes (match DIRECT path)
+  const std::string preboltBackup = objPath + ".prebolt";
+  {
+    std::string cp = std::string("cp ") + q(objPath) + " " + q(preboltBackup);
+    if (std::system(cp.c_str()) != 0) {
+      std::fprintf(stderr, "[Error] Failed to save pre-BOLT backup %s -> %s.\n", objPath.c_str(), preboltBackup.c_str());
+      return;
+    }
+    std::string cmd = q(objcopyBin) + " --remove-section=.riscv.attributes " +
+                      q(objPath) + ' ' + q(objPath) + " > /dev/null 2>&1";
+    if (std::system(cmd.c_str()) != 0) {
+      std::fprintf(stderr, "[Error] Pre-BOLT objcopy (in-place) failed.\n");
+      return;
+    }
+    struct stat st{};
+    if (::stat(preboltBackup.c_str(), &st) != 0 || st.st_size == 0) {
+      std::fprintf(stderr, "[Error] Pre-BOLT backup not created: %s\n", preboltBackup.c_str());
+      return;
+    }
+    std::printf("[INFO] Saved pre-BOLT file: %s\n", preboltBackup.c_str());
+  }
+
+  // 1) Run one BOLT attempt using its computed layout delta. It emits RAW
+  // (no strip) and ALIGNED (align-only) candidates.
+  auto boltOnce = [&](const std::string &input,
+                      std::string &outRaw, std::string &outAligned) -> bool {
+    const std::string rawFile      = objPath + ".opt.out";            // match DIRECT naming
+    const std::string alignedFile  = objPath + ".bolt.aligned.tmp";   // align-only candidate
+    const std::string logFile      = "bolt.log";
+
+    std::string boltCmd = q(boltBin) + ' ' + q(input) +
+                          " --use-old-text"
+                          " --align-text=0x2"
+                          " -v 3"
+                          " --align-functions=0x2"
+                          " --icf " + q(objPath) +            // strictly use objPath like DIRECT
+                          " -o " + q(rawFile) +
+                          " --ignore-build-id"
+                          " --remove-symtab"
+                          " --mini-rodata"
+                          " --use-gnu-stack";
+    if (fileSizeOf(runtimeTrace) > 0)
+      boltCmd += " --riscv-elim-runtime-trace=" + q(runtimeTrace);
+    std::printf("[BOLT-CMD input=%s] %s\n", input.c_str(), boltCmd.c_str());
+    boltCmd += " > " + logFile + " 2>&1";
+    if (std::system(boltCmd.c_str()) != 0)
+      return false;
+    if (!waitForFile(rawFile))
+      return false;
+
+    // ALIGN ONLY (no strip)
+    {
+      std::string alignCmd = q(objcopyBin) + " --set-section-alignment=.data=0x100 " +
+                             q(rawFile) + ' ' + q(alignedFile);
+      if (std::system(alignCmd.c_str()) != 0)
+        return false;
+    }
+
+    outRaw     = rawFile;     // DIRECT .opt.out
+    outAligned = alignedFile; // align-only
+    return true;
+  };
+
+  // Helper: perform only align+strip (no BOLT), used to normalize baseline
+  auto alignStripOnly = [&](const std::string &input, std::string &outAligned) -> bool {
+    const std::string outFile     = objPath + ".baseline.tmp";
+    const std::string alignedFile = objPath + ".baseline.aligned.tmp";
+
+    // Just copy input -> outFile
+    std::string cpCmd = std::string("cp ") + q(input) + " " + q(outFile);
+    if (std::system(cpCmd.c_str()) != 0)
+      return false;
+
+    // Align .data
+    std::string alignCmd = q(objcopyBin) + " --set-section-alignment=.data=0x100 " +
+                           q(outFile) + ' ' + q(alignedFile);
+    if (std::system(alignCmd.c_str()) != 0)
+      return false;
+
+    // Strip/remove extra sections
+    std::string stripCmd = q(objcopyBin) +
+                           " --strip-all --strip-sections"
+                           " --remove-section=.gnu.stack"
+                           " --remove-section=.riscv.attributes"
+                           " --remove-section=.note.gnu.build-id"
+                           " --remove-section=.comment " +
+                           q(alignedFile) + " > /dev/null 2>&1";
+    std::system(stripCmd.c_str());
+
+    outAligned = alignedFile;
+    return true;
+  };
+
+  auto stripOnly = [&](const std::string &input, std::string &outStripped) -> bool {
+    const std::string strippedFile = objPath + ".baseline.strip.tmp";
+
+    std::string cpCmd = std::string("cp ") + q(input) + " " + q(strippedFile);
+    if (std::system(cpCmd.c_str()) != 0)
+      return false;
+
+    std::string stripCmd =
+        q(objcopyBin) +
+        " --strip-all --strip-sections"
+        " --remove-section=.gnu.stack"
+        " --remove-section=.riscv.attributes"
+        " --remove-section=.note.gnu.build-id"
+        " --remove-section=.comment " +
+        q(strippedFile) + " > /dev/null 2>&1";
+    (void)std::system(stripCmd.c_str());
+
+    outStripped = strippedFile;
+    return true;
+  };
+
+  // 2) 基线：优先使用“原始输出(未改动)”；否则回退到就地删段后的/对齐后的
+  std::string baselineHexPre, baselineHexAligned, baselineHex;
+  std::string preAligned;
+
+  bool havePre = false;
+  bool haveAligned = false;
+  if (haveRunnableBaseline && !haveRaw) {
+    (void)alignStripOnly(objPath, preAligned);
+  } else {
+    havePre =
+        runQemuAndGetChecksumCtx(objPath, "BASELINE-PREBOLT", "-",
+                                 baselineHexPre);
+    if (havePre)
+      std::printf("[CHECKSUM-BASELINE-PREBOLT] %s\n",
+                  baselineHexPre.c_str());
+
+    haveAligned =
+        alignStripOnly(objPath, preAligned) &&
+        runQemuAndGetChecksumCtx(preAligned, "BASELINE-ALIGNED", "-",
+                                 baselineHexAligned);
+    if (haveAligned)
+      std::printf("[CHECKSUM-BASELINE-ALIGNED] %s\n",
+                  baselineHexAligned.c_str());
+  }
+
+  bool haveBaseline = false;
+  if (haveRaw) {
+    baselineHex = baselineHexRaw;
+    haveBaseline = true;
+  } else if (havePre) {
+    baselineHex = baselineHexPre;
+    haveBaseline = true;
+  } else if (haveAligned) {
+    baselineHex = baselineHexAligned;
+    haveBaseline = true;
+  }
+  if (haveBaseline)
+    std::printf("[CHECKSUM-BASELINE-USE] %s\n", baselineHex.c_str());
+
+  if (!haveBaseline) {
+    if (!haveRunnableBaseline) {
+      std::printf("[INFO] No runnable baseline available. Do single BOLT "
+                  "(no pack) and finish.\n");
+      std::string rawOnce, alignedOnce;
+      if (!boltOnce(objPath, rawOnce, alignedOnce)) {
+        std::fprintf(stderr, "[ERROR] BOLT fast-path failed (no baseline).\n");
+        return;
+      }
+      if (::rename(alignedOnce.c_str(), objPath.c_str()) != 0) {
+        std::perror("rename");
+      } else {
+        std::printf("[INFO] Installed BOLT output (no pack) atomically: %s\n",
+                    objPath.c_str());
+      }
+      return;
+    }
+
+    std::printf("[INFO] No baseline checksum available. Validating by full "
+                "QEMU output.\n");
+    std::vector<PayloadCandidate> candidates;
+    auto addOutputValidatedCandidate = [&](const std::string &path,
+                                           const std::string &label) -> bool {
+      long size = fileSizeOf(path);
+      if (size <= 0) {
+        std::fprintf(stderr, "[NO-CHECKSUM] reject %s: invalid size (%s)\n",
+                     label.c_str(), path.c_str());
+        return false;
+      }
+
+      QemuRunResult trial;
+      if (!runQemuCaptureCtx(path, label.c_str(), "no-checksum", trial,
+                             /*dumpOutput=*/false) ||
+          !qemuRunMatchesBaseline(trial, tracedBaseline)) {
+        std::fprintf(stderr,
+                     "[NO-CHECKSUM] reject %s: output mismatch or crash\n",
+                     label.c_str());
+        return false;
+      }
+
+      candidates.push_back({path, label, size});
+      std::printf("[NO-CHECKSUM] accepted %-16s size=%ld path=%s\n",
+                  label.c_str(), size, path.c_str());
+      return true;
+    };
+    auto addPackedOutputValidatedCandidates = [&](const std::string &path,
+                                                  const std::string &label) {
+      long inputSize = fileSizeOf(path);
+      if (inputSize <= 0)
+        return;
+
+      const std::string prefix =
+          objPath + ".cand.nochecksum." + sanitizePathTag(label);
+      if (inputSize > 50000) {
+        const std::string legacyPath = prefix + ".legacy.tmp";
+        if (copyFileForCandidate(path, legacyPath)) {
+          bool accepted = false;
+          if (packWithLegacyPacker(legacyPath))
+            accepted =
+                addOutputValidatedCandidate(legacyPath, label + "-legacy");
+          if (!accepted)
+            ::unlink(legacyPath.c_str());
+        }
+      } else {
+        std::printf("[NO-CHECKSUM] skip legacy packer for small input size=%ld "
+                    "path=%s\n",
+                    inputSize, path.c_str());
+      }
+
+      const std::string lz4Path = prefix + ".lz4.tmp";
+      if (copyFileForCandidate(path, lz4Path)) {
+        bool accepted = false;
+        if (packWithLZ4(lz4Path))
+          accepted = addOutputValidatedCandidate(lz4Path, label + "-lz4");
+        if (!accepted)
+          ::unlink(lz4Path.c_str());
+      }
+    };
+    auto addOutputCandidateSet = [&](const std::string &path,
+                                     const std::string &label) {
+      if (addOutputValidatedCandidate(path, label))
+        addPackedOutputValidatedCandidates(path, label);
+    };
+
+    std::string rawOnce, alignedOnce;
+    if (boltOnce(objPath, rawOnce, alignedOnce)) {
+      addOutputCandidateSet(rawOnce, "bolt-raw");
+      addOutputCandidateSet(alignedOnce, "bolt-aligned");
+    } else {
+      std::fprintf(stderr,
+                   "[NO-CHECKSUM] BOLT failed; using pre-BOLT candidates\n");
+    }
+
+    if (!preAligned.empty() || alignStripOnly(objPath, preAligned))
+      addOutputCandidateSet(preAligned, "prebolt-strip");
+
+    const std::string noplizeTrace = objPath + ".noplize.trace.txt";
+    const std::string preNoplized = objPath + ".prebolt.noplize.tmp";
+    const std::string preNoplizedAggressive =
+        objPath + ".prebolt.noplize.aggressive.tmp";
+    if (runQemuInAsmTrace(objPath, noplizeTrace)) {
+      if (makeRiscvNoplizedCandidate(objPath, noplizeTrace, preNoplized,
+                                     /*aggressive=*/false))
+        addOutputCandidateSet(preNoplized, "prebolt-noplize");
+      if (makeRiscvNoplizedCandidate(objPath, noplizeTrace,
+                                     preNoplizedAggressive,
+                                     /*aggressive=*/true))
+        addOutputCandidateSet(preNoplizedAggressive,
+                              "prebolt-noplize-aggressive");
+    }
+
+    std::string preStripped;
+    if (stripOnly(objPath, preStripped))
+      addOutputCandidateSet(preStripped, "prebolt-strip-noalign");
+
+    if (candidates.empty()) {
+      std::fprintf(stderr,
+                   "[NO-CHECKSUM] no valid candidate; restoring pre-BOLT\n");
+      if (::rename(preboltBackup.c_str(), objPath.c_str()) != 0)
+        std::perror("rename");
+      ::unlink(rawOnce.c_str());
+      ::unlink(alignedOnce.c_str());
+      ::unlink(preAligned.c_str());
+      ::unlink(preStripped.c_str());
+    } else {
+      auto best = std::min_element(
+          candidates.begin(), candidates.end(),
+          [](const PayloadCandidate &a, const PayloadCandidate &b) {
+            return a.size < b.size;
+          });
+      if (::rename(best->path.c_str(), objPath.c_str()) != 0)
+        std::perror("rename");
+      else
+        std::printf("[NO-CHECKSUM] installed %s candidate: %s\n",
+                    best->label.c_str(), objPath.c_str());
+
+      for (const PayloadCandidate &cand : candidates)
+        if (cand.path != best->path)
+          ::unlink(cand.path.c_str());
+    }
+    return;
+  }
+
+  // 4) Prepare and validate one layout-derived candidate.
+  auto attempt = [&](std::string &finalProduced,
+                std::string &boltAlignedOut) -> bool {
+    std::string rawOut, alignedOut;
+    if (!boltOnce(objPath, rawOut, alignedOut)) {
+      std::fprintf(stderr, "[WARN] BOLT attempt failed.\n");
+      return false;
+    }
+
+    // Run TRIAL on both RAW (no align) and ALIGNED
+    std::string trialRawHex, trialAlignedHex;
+    bool okRaw = runQemuAndGetChecksumCtx(rawOut, "TRIAL-RAW", "-", trialRawHex);
+    bool okAli =
+        runQemuAndGetChecksumCtx(alignedOut, "TRIAL-ALIGNED", "-", trialAlignedHex);
+
+    if (!okRaw && !okAli) {
+      std::fprintf(stderr, "[WARN] No trial checksum from either RAW or ALIGNED.\n");
+      return false;
+    }
+    if (okRaw)
+      std::printf("[CHECKSUM-TRIAL-RAW] %s\n", trialRawHex.c_str());
+    if (okAli)
+      std::printf("[CHECKSUM-TRIAL-ALIGNED] %s\n", trialAlignedHex.c_str());
+
+    // Choose candidate for pack only if TRIAL matches BASELINE.
+    // If neither RAW nor ALIGNED matches BASELINE, skip packing.
+    std::string chosen;
+    bool alignBad = false;
+    bool rawMatches = okRaw && (trialRawHex == baselineHex);
+    bool aliMatches = okAli && (trialAlignedHex == baselineHex);
+
+    auto fsize = [](const std::string &p) -> long {
+      struct stat st{}; if (::stat(p.c_str(), &st) == 0) return (long)st.st_size; return -1;
+    };
+
+    if (aliMatches && !rawMatches) {
+      chosen = alignedOut; // aligned is good
+    } else if (rawMatches && !aliMatches) {
+      std::printf("[ALIGN REGRESSION] RAW matches baseline but ALIGNED differs. Disabling alignment for this flow.\n");
+      chosen = rawOut;     // use raw (no-align)
+      alignBad = true;
+    } else if (rawMatches && aliMatches) {
+      long szRaw = fsize(rawOut);
+      long szAli = fsize(alignedOut);
+      if (szRaw >= 0 && szAli >= 0) {
+        if (szRaw <= szAli) { chosen = rawOut; std::printf("[PICK] both match baseline -> choose RAW (raw=%ld, aligned=%ld)\n", szRaw, szAli); }
+        else                 { chosen = alignedOut; std::printf("[PICK] both match baseline -> choose ALIGNED (raw=%ld, aligned=%ld)\n", szRaw, szAli); }
+      } else {
+        chosen = alignedOut; // fallback policy
+      }
+    } else {
+      std::fprintf(stderr,
+                   "[SKIP PACK] trial checksum does not match baseline (raw=%s, aligned=%s, baseline=%s).\n",
+                   okRaw ? trialRawHex.c_str() : "<none>",
+                   okAli ? trialAlignedHex.c_str() : "<none>",
+                   baselineHex.c_str());
+      return false;
+    }
+
+    // === IMPORTANT ===
+    // Mirror DIRECT path: align+strip the chosen candidate BEFORE feeding to packer.
+    const std::string packInput = objPath + ".pack.input.tmp";
+    const std::string packAligned = objPath + ".pack.input.aligned.tmp";
+    const std::string offsetTag = "layout";
+
+    // Copy chosen -> packInput
+    {
+      std::string cpCmd = "cp " + q(chosen) + " " + q(packInput);
+      if (std::system(cpCmd.c_str()) != 0) {
+        std::fprintf(stderr, "[ERROR] Failed to prepare pack input.\n");
+        return false;
+      }
+    }
+
+    // Align .data (packInput -> packAligned)
+    {
+      std::string alignCmd = q(objcopyBin) + " --set-section-alignment=.data=0x100 " +
+                             q(packInput) + ' ' + q(packAligned);
+      if (std::system(alignCmd.c_str()) != 0) {
+        std::fprintf(stderr, "[ERROR] objcopy align for pack failed.\n");
+        return false;
+      }
+    }
+
+    // Strip/remove extra sections (in-place on packAligned)
+    {
+      std::string stripCmd = q(objcopyBin) +
+                             " --strip-all --strip-sections"
+                             " --remove-section=.gnu.stack"
+                             " --remove-section=.riscv.attributes"
+                             " --remove-section=.note.gnu.build-id " +
+                             q(packAligned) + " > /dev/null 2>&1";
+      (void)std::system(stripCmd.c_str());
+    }
+
+    // Size log before deciding packer
+    {
+      long szChosen = fsize(chosen);
+      long szPackIn = fsize(packAligned);
+      if (szChosen >= 0 && szPackIn >= 0)
+        std::printf("[SIZE] chosen=%ld, prepack(stripped+aligned)=%ld\n", szChosen, szPackIn);
+    }
+
+    std::string noplizedRaw;
+    std::string noplizedPackAligned;
+    std::string noplizedAggressiveRaw;
+    std::string noplizedAggressivePackAligned;
+    std::string noplizeTrace;
+    {
+      noplizeTrace = objPath + ".pack.noplize." + sanitizePathTag(offsetTag) +
+                     ".trace.txt";
+
+      auto buildNoplizedPackInput = [&](const std::string &rawPath,
+                                        std::string &alignedPath,
+                                        bool aggressive) -> bool {
+        if (!makeRiscvNoplizedCandidate(chosen, noplizeTrace, rawPath,
+                                        aggressive))
+          return false;
+        alignedPath = rawPath + ".aligned.tmp";
+        std::string alignCmd =
+            q(objcopyBin) + " --set-section-alignment=.data=0x100 " +
+            q(rawPath) + ' ' + q(alignedPath);
+        if (std::system(alignCmd.c_str()) == 0) {
+          std::string stripCmd = q(objcopyBin) +
+                                 " --strip-all --strip-sections"
+                                 " --remove-section=.gnu.stack"
+                                 " --remove-section=.riscv.attributes"
+                                 " --remove-section=.note.gnu.build-id " +
+                                 q(alignedPath) +
+                                 " > /dev/null 2>&1";
+          (void)std::system(stripCmd.c_str());
+          return true;
+        } else {
+          std::fprintf(stderr,
+                       "[NOPLIZE] objcopy align failed for checksum candidate\n");
+          alignedPath.clear();
+          return false;
+        }
+      };
+
+      const std::string noplizeBase =
+          objPath + ".pack.noplize." + sanitizePathTag(offsetTag);
+      if (runQemuInAsmTrace(chosen, noplizeTrace)) {
+        noplizedRaw = noplizeBase + ".tmp";
+        if (!buildNoplizedPackInput(noplizedRaw, noplizedPackAligned,
+                                    /*aggressive=*/false))
+          noplizedRaw.clear();
+
+        noplizedAggressiveRaw = noplizeBase + ".aggressive.tmp";
+        if (!buildNoplizedPackInput(noplizedAggressiveRaw,
+                                    noplizedAggressivePackAligned,
+                                    /*aggressive=*/true))
+          noplizedAggressiveRaw.clear();
+      }
+    }
+
+    std::string originalBest;
+    std::string originalBestLabel;
+    bool haveOriginal = selectBestPayloadCandidate(
+        packAligned, objPath, baselineHex, offsetTag,
+        /*requireChecksum=*/true, originalBest, originalBestLabel);
+
+    std::string noplizedBest;
+    std::string noplizedBestLabel;
+    bool haveNoplized =
+        !noplizedPackAligned.empty() && fileSizeOf(noplizedPackAligned) > 0 &&
+        selectBestPayloadCandidate(noplizedPackAligned, objPath, baselineHex,
+                                   offsetTag + "-noplize",
+                                   /*requireChecksum=*/true, noplizedBest,
+                                   noplizedBestLabel);
+
+    std::string noplizedAggressiveBest;
+    std::string noplizedAggressiveBestLabel;
+    bool haveNoplizedAggressive =
+        !noplizedAggressivePackAligned.empty() &&
+        fileSizeOf(noplizedAggressivePackAligned) > 0 &&
+        selectBestPayloadCandidate(noplizedAggressivePackAligned, objPath,
+                                   baselineHex,
+                                   offsetTag + "-noplize-aggressive",
+                                   /*requireChecksum=*/true,
+                                   noplizedAggressiveBest,
+                                   noplizedAggressiveBestLabel);
+
+    std::vector<PayloadCandidate> bests;
+    if (haveOriginal)
+      bests.push_back(
+          {originalBest, originalBestLabel, fileSizeOf(originalBest)});
+    if (haveNoplized)
+      bests.push_back({noplizedBest, "noplize-" + noplizedBestLabel,
+                       fileSizeOf(noplizedBest)});
+    if (haveNoplizedAggressive)
+      bests.push_back({noplizedAggressiveBest,
+                       "noplize-aggressive-" + noplizedAggressiveBestLabel,
+                       fileSizeOf(noplizedAggressiveBest)});
+
+    if (!bests.empty()) {
+      auto Best = std::min_element(
+          bests.begin(), bests.end(),
+          [](const PayloadCandidate &A, const PayloadCandidate &B) {
+            return A.size < B.size;
+          });
+      finalProduced = Best->path;
+      std::string bestLabel = Best->label;
+
+      for (const PayloadCandidate &Cand : bests)
+        if (Cand.path != finalProduced)
+          ::unlink(Cand.path.c_str());
+
+      std::printf("[CHECK] selected %s candidate matches BASELINE%s\n",
+                  bestLabel.c_str(), alignBad ? " (no-align)" : "");
+      boltAlignedOut = finalProduced;
+      ::unlink(packInput.c_str());
+      if (!noplizedRaw.empty())
+        ::unlink(noplizedRaw.c_str());
+      if (!noplizeTrace.empty())
+        ::unlink(noplizeTrace.c_str());
+      if (!packAligned.empty() && packAligned != finalProduced)
+        ::unlink(packAligned.c_str());
+      if (!noplizedPackAligned.empty() && noplizedPackAligned != finalProduced)
+        ::unlink(noplizedPackAligned.c_str());
+      if (!noplizedAggressiveRaw.empty())
+        ::unlink(noplizedAggressiveRaw.c_str());
+      if (!noplizedAggressivePackAligned.empty() &&
+          noplizedAggressivePackAligned != finalProduced)
+        ::unlink(noplizedAggressivePackAligned.c_str());
+      return true;
+    }
+
+    ::unlink(packInput.c_str());
+    if (!noplizeTrace.empty())
+      ::unlink(noplizeTrace.c_str());
+    if (!noplizedRaw.empty())
+      ::unlink(noplizedRaw.c_str());
+    if (!noplizedPackAligned.empty())
+      ::unlink(noplizedPackAligned.c_str());
+    if (!noplizedAggressiveRaw.empty())
+      ::unlink(noplizedAggressiveRaw.c_str());
+    if (!noplizedAggressivePackAligned.empty())
+      ::unlink(noplizedAggressivePackAligned.c_str());
+    ::unlink(packAligned.c_str());
+    finalProduced.clear();
+    // return the chosen BOLT output so caller can install it as fallback if all attempts fail
+    boltAlignedOut = chosen;
+    return false;
+  };
+
+  std::string finalToInstall;
+  std::string lastBoltAlignedOut;
+
+  (void)attempt(finalToInstall, lastBoltAlignedOut);
+  if (!finalToInstall.empty()) {
+    if (::rename(finalToInstall.c_str(), objPath.c_str()) != 0) {
+      std::perror("rename");
+    } else {
+      bool usedPacker = finalToInstall.find(".legacy.tmp") != std::string::npos ||
+                        finalToInstall.find(".lz4.tmp") != std::string::npos;
+      std::printf("[INFO] Installed %s atomically: %s\n",
+                  usedPacker?"packed binary":"BOLT output (no pack)", objPath.c_str());
+    }
+    return;
+  }
+
+  if (!lastBoltAlignedOut.empty()) {
+    if (::rename(lastBoltAlignedOut.c_str(), objPath.c_str()) != 0) {
+      std::perror("rename");
+    } else {
+      std::printf("[INFO] Installed un-packed BOLT output as fallback: %s\n", objPath.c_str());
+    }
+  } else {
+    std::fprintf(stderr, "[ERROR] No BOLT output available for fallback.\n");
+  }
+  // preboltPath 保留
+}
+
+#endif
+#endif
+
+// Do actual linking. Note that when this function is called,
+// all linker scripts have already been parsed.
+void LinkerDriver::link(opt::InputArgList &args) {
+  llvm::TimeTraceScope timeScope("Link", StringRef("LinkerDriver::Link"));
+  // If a --hash-style option was not given, set to a default value,
+  // which varies depending on the target.
+  if (!args.hasArg(OPT_hash_style)) {
+    if (config->emachine == EM_MIPS)
+      config->sysvHash = true;
+    else
+      config->sysvHash = config->gnuHash = true;
+  }
+
+  // Default output filename is "a.out" by the Unix tradition.
+  if (config->outputFile.empty())
+    config->outputFile = "a.out";
+
+  // Fail early if the output file or map file is not writable. If a user has a
+  // long link, e.g. due to a large LTO link, they do not wish to run it and
+  // find that it failed because there was a mistake in their command-line.
+  {
+    llvm::TimeTraceScope timeScope("Create output files");
+    if (auto e = tryCreateFile(config->outputFile))
+      error("cannot open output file " + config->outputFile + ": " +
+            e.message());
+    if (auto e = tryCreateFile(config->mapFile))
+      error("cannot open map file " + config->mapFile + ": " + e.message());
+    if (auto e = tryCreateFile(config->whyExtract))
+      error("cannot open --why-extract= file " + config->whyExtract + ": " +
+            e.message());
+  }
+  if (errorCount())
+    return;
+
+  // Use default entry point name if no name was given via the command
+  // line nor linker scripts. For some reason, MIPS entry point name is
+  // different from others.
+  config->warnMissingEntry =
+      (!config->entry.empty() || (!config->shared && !config->relocatable));
+  if (config->entry.empty() && !config->relocatable)
+    config->entry = (config->emachine == EM_MIPS) ? "__start" : "_start";
+
+  // Handle --trace-symbol.
+  for (auto *arg : args.filtered(OPT_trace_symbol))
+    symtab.insert(arg->getValue())->traced = true;
+
+  // Handle -u/--undefined before input files. If both a.a and b.so define foo,
+  // -u foo a.a b.so will extract a.a.
+  for (StringRef name : config->undefined)
+    addUnusedUndefined(name)->referenced = true;
+
+  // Add all files to the symbol table. This will add almost all
+  // symbols that we need to the symbol table. This process might
+  // add files to the link, via autolinking, these files are always
+  // appended to the Files vector.
+  {
+    llvm::TimeTraceScope timeScope("Parse input files");
+    for (size_t i = 0; i < files.size(); ++i) {
+      llvm::TimeTraceScope timeScope("Parse input files", files[i]->getName());
+      parseFile(files[i]);
+    }
+    if (armCmseImpLib)
+      parseArmCMSEImportLib(*armCmseImpLib);
+  }
+
+  // Now that we have every file, we can decide if we will need a
+  // dynamic symbol table.
+  // We need one if we were asked to export dynamic symbols or if we are
+  // producing a shared library.
+  // We also need one if any shared libraries are used and for pie executables
+  // (probably because the dynamic linker needs it).
+  config->hasDynSymTab =
+      !ctx.sharedFiles.empty() || config->isPic || config->exportDynamic;
+
+  // Some symbols (such as __ehdr_start) are defined lazily only when there
+  // are undefined symbols for them, so we add these to trigger that logic.
+  for (StringRef name : script->referencedSymbols) {
+    Symbol *sym = addUnusedUndefined(name);
+    sym->isUsedInRegularObj = true;
+    sym->referenced = true;
+  }
+
+  // Prevent LTO from removing any definition referenced by -u.
+  for (StringRef name : config->undefined)
+    if (Defined *sym = dyn_cast_or_null<Defined>(symtab.find(name)))
+      sym->isUsedInRegularObj = true;
+
+  // If an entry symbol is in a static archive, pull out that file now.
+  if (Symbol *sym = symtab.find(config->entry))
+    handleUndefined(sym, "--entry");
+
+  // Handle the `--undefined-glob <pattern>` options.
+  for (StringRef pat : args::getStrings(args, OPT_undefined_glob))
+    handleUndefinedGlob(pat);
+
+  // Mark -init and -fini symbols so that the LTO doesn't eliminate them.
+  if (Symbol *sym = dyn_cast_or_null<Defined>(symtab.find(config->init)))
+    sym->isUsedInRegularObj = true;
+  if (Symbol *sym = dyn_cast_or_null<Defined>(symtab.find(config->fini)))
+    sym->isUsedInRegularObj = true;
+
+  // If any of our inputs are bitcode files, the LTO code generator may create
+  // references to certain library functions that might not be explicit in the
+  // bitcode file's symbol table. If any of those library functions are defined
+  // in a bitcode file in an archive member, we need to arrange to use LTO to
+  // compile those archive members by adding them to the link beforehand.
+  //
+  // However, adding all libcall symbols to the link can have undesired
+  // consequences. For example, the libgcc implementation of
+  // __sync_val_compare_and_swap_8 on 32-bit ARM pulls in an .init_array entry
+  // that aborts the program if the Linux kernel does not support 64-bit
+  // atomics, which would prevent the program from running even if it does not
+  // use 64-bit atomics.
+  //
+  // Therefore, we only add libcall symbols to the link before LTO if we have
+  // to, i.e. if the symbol's definition is in bitcode. Any other required
+  // libcall symbols will be added to the link after LTO when we add the LTO
+  // object file to the link.
+  if (!ctx.bitcodeFiles.empty())
+    for (auto *s : lto::LTO::getRuntimeLibcallSymbols())
+      handleLibcall(s);
+
+  // Archive members defining __wrap symbols may be extracted.
+  std::vector<WrappedSymbol> wrapped = addWrappedSymbols(args);
+
+  // No more lazy bitcode can be extracted at this point. Do post parse work
+  // like checking duplicate symbols.
+  parallelForEach(ctx.objectFiles, [](ELFFileBase *file) {
+    initSectionsAndLocalSyms(file, /*ignoreComdats=*/false);
+  });
+  parallelForEach(ctx.objectFiles, postParseObjectFile);
+  parallelForEach(ctx.bitcodeFiles,
+                  [](BitcodeFile *file) { file->postParse(); });
+  for (auto &it : ctx.nonPrevailingSyms) {
+    Symbol &sym = *it.first;
+    Undefined(sym.file, sym.getName(), sym.binding, sym.stOther, sym.type,
+              it.second)
+        .overwrite(sym);
+    cast<Undefined>(sym).nonPrevailing = true;
+  }
+  ctx.nonPrevailingSyms.clear();
+  for (const DuplicateSymbol &d : ctx.duplicates)
+    reportDuplicate(*d.sym, d.file, d.section, d.value);
+  ctx.duplicates.clear();
+
+  // Return if there were name resolution errors.
+  if (errorCount())
+    return;
+
+  // We want to declare linker script's symbols early,
+  // so that we can version them.
+  // They also might be exported if referenced by DSOs.
+  script->declareSymbols();
+
+  // Handle --exclude-libs. This is before scanVersionScript() due to a
+  // workaround for Android ndk: for a defined versioned symbol in an archive
+  // without a version node in the version script, Android does not expect a
+  // 'has undefined version' error in -shared --exclude-libs=ALL mode (PR36295).
+  // GNU ld errors in this case.
+  if (args.hasArg(OPT_exclude_libs))
+    excludeLibs(args);
+
+  // Create elfHeader early. We need a dummy section in
+  // addReservedSymbols to mark the created symbols as not absolute.
+  Out::elfHeader = make<OutputSection>("", 0, SHF_ALLOC);
+
+  // We need to create some reserved symbols such as _end. Create them.
+  if (!config->relocatable)
+    addReservedSymbols();
+
+  // Apply version scripts.
+  //
+  // For a relocatable output, version scripts don't make sense, and
+  // parsing a symbol version string (e.g. dropping "@ver1" from a symbol
+  // name "foo@ver1") rather do harm, so we don't call this if -r is given.
+  if (!config->relocatable) {
+    llvm::TimeTraceScope timeScope("Process symbol versions");
+    symtab.scanVersionScript();
+  }
+
+  // Skip the normal linked output if some LTO options are specified.
+  //
+  // For --thinlto-index-only, index file creation is performed in
+  // compileBitcodeFiles, so we are done afterwards. --plugin-opt=emit-llvm and
+  // --plugin-opt=emit-asm create output files in bitcode or assembly code,
+  // respectively. When only certain thinLTO modules are specified for
+  // compilation, the intermediate object file are the expected output.
+  const bool skipLinkedOutput = config->thinLTOIndexOnly || config->emitLLVM ||
+                                config->ltoEmitAsm ||
+                                !config->thinLTOModulesToCompile.empty();
+
+  // Do link-time optimization if given files are LLVM bitcode files.
+  // This compiles bitcode files into real object files.
+  //
+  // With this the symbol table should be complete. After this, no new names
+  // except a few linker-synthesized ones will be added to the symbol table.
+  const size_t numObjsBeforeLTO = ctx.objectFiles.size();
+  invokeELFT(compileBitcodeFiles, skipLinkedOutput);
+
+  // Symbol resolution finished. Report backward reference problems,
+  // --print-archive-stats=, and --why-extract=.
+  reportBackrefs();
+  writeArchiveStats();
+  writeWhyExtract();
+#if defined(ENABLE_AUTOTUNER)
+  // AUTO-TUNING - finalization
+  if (Error E = autotuning::Engine.finalize()) {
+    error(toString(std::move(E)));
+  }
+#endif
+  if (errorCount())
+    return;
+
+  // Bail out if normal linked output is skipped due to LTO.
+  if (skipLinkedOutput)
+    return;
+
+  // compileBitcodeFiles may have produced lto.tmp object files. After this, no
+  // more file will be added.
+  auto newObjectFiles = ArrayRef(ctx.objectFiles).slice(numObjsBeforeLTO);
+  parallelForEach(newObjectFiles, [](ELFFileBase *file) {
+    initSectionsAndLocalSyms(file, /*ignoreComdats=*/true);
+  });
+  parallelForEach(newObjectFiles, postParseObjectFile);
+  for (const DuplicateSymbol &d : ctx.duplicates)
+    reportDuplicate(*d.sym, d.file, d.section, d.value);
+
+  // Handle --exclude-libs again because lto.tmp may reference additional
+  // libcalls symbols defined in an excluded archive. This may override
+  // versionId set by scanVersionScript().
+  if (args.hasArg(OPT_exclude_libs))
+    excludeLibs(args);
+
+  // Record [__acle_se_<sym>, <sym>] pairs for later processing.
+  processArmCmseSymbols();
+
+  // Apply symbol renames for --wrap and combine foo@v1 and foo@@v1.
+  redirectSymbols(wrapped);
+
+  // Replace common symbols with regular symbols.
+  replaceCommonSymbols();
+
+  {
+    llvm::TimeTraceScope timeScope("Aggregate sections");
+    // Now that we have a complete list of input files.
+    // Beyond this point, no new files are added.
+    // Aggregate all input sections into one place.
+    for (InputFile *f : ctx.objectFiles) {
+      for (InputSectionBase *s : f->getSections()) {
+        if (!s || s == &InputSection::discarded)
+          continue;
+        if (LLVM_UNLIKELY(isa<EhInputSection>(s)))
+          ctx.ehInputSections.push_back(cast<EhInputSection>(s));
+        else
+          ctx.inputSections.push_back(s);
+      }
+    }
+    for (BinaryFile *f : ctx.binaryFiles)
+      for (InputSectionBase *s : f->getSections())
+        ctx.inputSections.push_back(cast<InputSection>(s));
+  }
+
+  {
+    llvm::TimeTraceScope timeScope("Strip sections");
+    if (ctx.hasSympart.load(std::memory_order_relaxed)) {
+      llvm::erase_if(ctx.inputSections, [](InputSectionBase *s) {
+        if (s->type != SHT_LLVM_SYMPART)
+          return false;
+        invokeELFT(readSymbolPartitionSection, s);
+        return true;
+      });
+    }
+    // We do not want to emit debug sections if --strip-all
+    // or --strip-debug are given.
+    if (config->strip != StripPolicy::None) {
+      llvm::erase_if(ctx.inputSections, [](InputSectionBase *s) {
+        if (isDebugSection(*s))
+          return true;
+        if (auto *isec = dyn_cast<InputSection>(s))
+          if (InputSectionBase *rel = isec->getRelocatedSection())
+            if (isDebugSection(*rel))
+              return true;
+
+        return false;
+      });
+    }
+  }
+
+  // Since we now have a complete set of input files, we can create
+  // a .d file to record build dependencies.
+  if (!config->dependencyFile.empty())
+    writeDependencyFile();
+
+  // Now that the number of partitions is fixed, save a pointer to the main
+  // partition.
+  mainPart = &partitions[0];
+
+  // Read .note.gnu.property sections from input object files which
+  // contain a hint to tweak linker's and loader's behaviors.
+  config->andFeatures = getAndFeatures();
+
+  // The Target instance handles target-specific stuff, such as applying
+  // relocations or writing a PLT section. It also contains target-dependent
+  // values such as a default image base address.
+  target = getTarget();
+
+  config->eflags = target->calcEFlags();
+  // maxPageSize (sometimes called abi page size) is the maximum page size that
+  // the output can be run on. For example if the OS can use 4k or 64k page
+  // sizes then maxPageSize must be 64k for the output to be useable on both.
+  // All important alignment decisions must use this value.
+  config->maxPageSize = getMaxPageSize(args);
+  // commonPageSize is the most common page size that the output will be run on.
+  // For example if an OS can use 4k or 64k page sizes and 4k is more common
+  // than 64k then commonPageSize is set to 4k. commonPageSize can be used for
+  // optimizations such as DATA_SEGMENT_ALIGN in linker scripts. LLD's use of it
+  // is limited to writing trap instructions on the last executable segment.
+  config->commonPageSize = getCommonPageSize(args);
+
+  config->imageBase = getImageBase(args);
+
+  // This adds a .comment section containing a version string.
+  if (!config->relocatable)
+    ctx.inputSections.push_back(createCommentSection());
+
+  // Split SHF_MERGE and .eh_frame sections into pieces in preparation for garbage collection.
+  invokeELFT(splitSections,);
+
+  // Garbage collection and removal of shared symbols from unused shared objects.
+  invokeELFT(markLive,);
+  demoteSharedAndLazySymbols();
+
+  // Make copies of any input sections that need to be copied into each
+  // partition.
+  copySectionsIntoPartitions();
+
+  // Create synthesized sections such as .got and .plt. This is called before
+  // processSectionCommands() so that they can be placed by SECTIONS commands.
+  invokeELFT(createSyntheticSections,);
+
+  // Some input sections that are used for exception handling need to be moved
+  // into synthetic sections. Do that now so that they aren't assigned to
+  // output sections in the usual way.
+  if (!config->relocatable)
+    combineEhSections();
+
+  // Merge .riscv.attributes sections.
+  if (config->emachine == EM_RISCV)
+    mergeRISCVAttributesSections();
+
+  {
+    llvm::TimeTraceScope timeScope("Assign sections");
+
+    // Create output sections described by SECTIONS commands.
+    script->processSectionCommands();
+
+    // Linker scripts control how input sections are assigned to output
+    // sections. Input sections that were not handled by scripts are called
+    // "orphans", and they are assigned to output sections by the default rule.
+    // Process that.
+    script->addOrphanSections();
+  }
+
+  {
+    llvm::TimeTraceScope timeScope("Merge/finalize input sections");
+
+    // Migrate InputSectionDescription::sectionBases to sections. This includes
+    // merging MergeInputSections into a single MergeSyntheticSection. From this
+    // point onwards InputSectionDescription::sections should be used instead of
+    // sectionBases.
+    for (SectionCommand *cmd : script->sectionCommands)
+      if (auto *osd = dyn_cast<OutputDesc>(cmd))
+        osd->osec.finalizeInputSections();
+  }
+
+  // Two input sections with different output sections should not be folded.
+  // ICF runs after processSectionCommands() so that we know the output sections.
+  if (config->icf != ICFLevel::None) {
+    invokeELFT(findKeepUniqueSections, args);
+    invokeELFT(doIcf,);
+  }
+
+  // Read the callgraph now that we know what was gced or icfed
+  if (config->callGraphProfileSort) {
+    if (auto *arg = args.getLastArg(OPT_call_graph_ordering_file))
+      if (std::optional<MemoryBufferRef> buffer = readFile(arg->getValue()))
+        readCallGraph(*buffer);
+    invokeELFT(readCallGraphsFromObjectFiles,);
+  }
+
+  // Write the result to the file.
+  invokeELFT(writeResult,);
+#ifdef LLD_RISCV_PACKER
+#ifdef TOOLCHAIN_INSTALL_PATH
+  // Avoid recursion when packer internally invokes clang/lld again
+  if (!std::getenv("RV_PACKING")) {
+    std::string out = config->outputFile.str();
+    // base filename only
+    size_t p = out.find_last_of("/\\");
+    std::string base = (p == std::string::npos) ? out : out.substr(p + 1);
+
+    runBoltAndPack(out);
+  } else {
+    std::printf("[INFO] RV_PACKING set, skip runBoltAndPack for internal link: %s\n",
+                config->outputFile.str().c_str());
+  }
+#endif
+#endif
+}

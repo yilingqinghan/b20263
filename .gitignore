@@ -1,0 +1,215 @@
+#==============================================================================#
+# This file specifies intentionally untracked files that git should ignore.
+# See: http://www.kernel.org/pub/software/scm/git/docs/gitignore.html
+#
+# This file is intentionally different from the output of `git svn show-ignore`,
+# as most of those are useless.
+#==============================================================================#
+
+#==============================================================================#
+# File extensions to be ignored anywhere in the tree.
+#==============================================================================#
+# Temp files created by most text editors.
+*~
+# Merge files created by git.
+*.orig
+# Reject files created by patch.
+*.rej
+# Byte compiled python modules.
+*.pyc
+# vim swap files
+.*.sw?
+.sw?
+#OS X specific files.
+.DS_store
+
+# Ignore the user specified CMake presets in subproject directories.
+/*/CMakeUserPresets.json
+
+# Nested build directory
+/build*
+
+#==============================================================================#
+# Explicit files to ignore (only matches one).
+#==============================================================================#
+# Various tag programs
+/tags
+/TAGS
+/GPATH
+/GRTAGS
+/GSYMS
+/GTAGS
+/ID
+.gitusers
+autom4te.cache
+cscope.files
+cscope.out
+autoconf/aclocal.m4
+autoconf/autom4te.cache
+/compile_commands.json
+# Visual Studio built-in CMake configuration
+/CMakeSettings.json
+# CLion project configuration
+**/.idea
+bolt/cmake-build-debug
+#==============================================================================#
+# Directories to ignore (do not add trailing '/'s, they skip symlinks).
+#==============================================================================#
+# VS2017 and VSCode config files.
+.vscode
+.vs
+# pythonenv for github Codespaces
+pythonenv*
+# clangd index. (".clangd" is a config file now, thus trailing slash)
+.clangd/
+.cache
+# static analyzer regression testing project files
+/clang/utils/analyzer/projects/*/CachedSource
+/clang/utils/analyzer/projects/*/PatchedSource
+/clang/utils/analyzer/projects/*/ScanBuildResults
+/clang/utils/analyzer/projects/*/RefScanBuildResults
+# automodapi puts generated documentation files here.
+/lldb/docs/python_api/
+
+test/4743/bm.out
+test/4743/expect.txt
+test/4743/log
+test/4743/output.txt
+test/4743/prof.out
+test/4743/rnd.final.out
+test/4743/rnd.opt.out
+test/4743/rnd.out
+test/4743/rnd.out.mini
+test/4743/rnd.txt
+test/4743/run_rnd_bak.sh
+test/4743/trace.txt
+test/bm1.32/1
+test/bm1.32/2
+test/bm1.32/3
+test/bm1.32/bm1.final.dump
+test/bm1.32/bm1.final.out
+test/bm1.32/bm1.opt.out
+test/bm1.32/bm1.out.mini
+test/bm1.32/log2
+test/bm1.32/modified_bm1.s
+test/bm1.32/output.txt
+test/bm1.32/replace.py
+test/bm1.32/trace.txt
+test/bm2/1
+test/bm2/2
+test/bm2/bm1.out
+test/bm2/bm2.final.out
+test/bm2/bm2.opt.out
+test/bm2/bm2.out
+test/bm2/bm2.out.mini
+test/bm2/bm2_1.o
+test/bm2/bm2_2.o
+test/bm2/bm2_3.o
+test/bm2/bm2_4.o
+test/bm2/expect.txt
+test/bm2/log
+test/bm2/output.txt
+test/bm2/prof.out
+test/bm2/trace.txt
+test/bm3/bm3.final.out
+test/bm3/bm3.opt.out
+test/bm3/bm3.out
+test/bm3/bm3.out.mini
+test/bm3/log
+test/bm3/prof
+test/bm3/prof.out
+test/bm3/qrduino
+test/bm3/qrduino.dump
+test/bm3/qrduino.final
+test/bm3/qrduino.mini
+test/bm3/qrduino.opt
+test/bm3/qrduino.org.dump
+test/bm3/qrencode.o
+test/bm3/qrframe.o
+test/bm3/qrtest.o
+test/bm3/trace.txt
+test/run_exam_修改.sh
+test/4743/rnd.pack.out
+test/4743/rnd_output0.o
+test/4743/rnd_output1.o
+test/bm1/bm1.opt.out
+test/bm1/bm1.out
+test/bm1/bm1.pack.out
+test/bm1/log
+test/bm1/output.txt
+test/bm1/prof.out
+test/bm2/bm2.pack.out
+test/bm3/qrduino.pack
+test/bm3/support/beebsc.o
+test/bm3/support/boardsupport.o
+test/bm3/support/chipsupport.o
+test/bm3/support/main.o
+test/bm4/huffbench
+test/bm4/huffbench.final.out
+test/bm4/huffbench.mini
+test/bm4/huffbench.opt.out
+test/bm4/huffbench.pack.out
+test/bm4/log
+test/bm4/prof.out
+test/bm5/log
+test/bm5/prof.out
+test/bm5/sglib-combined
+test/bm5/sglib-combined.final.out
+test/bm5/sglib-combined.mini
+test/bm5/sglib-combined.opt.out
+test/bm5/sglib-combined.pack.out
+test/upx-full/out/bm1.pack.out
+test/upx-full/out/bm2.pack.out
+test/upx-full/out/packed.elf
+test/upx-full/out/rnd.pack.out
+test/upx-full/out/stub.elf
+*/**/trace.txt
+test-release/**/*.out
+test-release/bm5/sglib-combined
+test-release/bm4/huffbench
+
+results.log
+results2.log
+results3.log
+test-release/4743/1
+test-release/4743/2
+test-release/4743/bolt.log
+test-release/bm1/1
+test-release/bm1/2
+test-release/bm1/bolt.log
+test-release/bm1/test.py
+test-release/bm2/1
+test-release/bm2/bolt.log
+test-release/bm2/tmp.log
+test-release/bm3/.DS_Store
+test-release/bm3/1
+test-release/bm3/2
+test-release/bm3/bolt.log
+test-release/bm3/qrduino
+test-release/bm4/bolt.log
+test-release/bm5/bolt.log
+test-release/exam_score.json
+test-release/randoms/
+test/bm4/huff.dump
+ubuntu18.04-codesize.tar.xz
+test-release/bm1/bm1.out.bolt.aligned.tmp
+test-release/bm1/bm1.out.bolt.tmp
+test-release/bm1/bm1.out.prebolt
+test-release/4743/rnd.out.baseline.aligned.tmp
+test-release/4743/rnd.out.baseline.tmp
+test-release/4743/rnd.out.bolt.aligned.tmp
+test-release/4743/rnd.out.bolt.tmp
+test-release/4743/rnd.out.pack.input.tmp
+test-release/4743/rnd.out.prebolt
+test-release/bm2/bm2.out.bolt.tmp
+test-release/bm2/bm2.out.prebolt
+test-release/bm2/failed_bins/
+test-release/bm3/failed_bins/
+test-release/bm3/qrduino.bolt.tmp
+test-release/bm3/qrduino.prebolt
+test-release/bm4/failed_bins/
+test-release/bm4/huffbench.bolt.tmp
+test-release/bm4/huffbench.prebolt
+test-release/bm5/failed_bins/
+test-release/4743/failed_bins/
+ubuntu18.04-codesize.tar

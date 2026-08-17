@@ -3509,10 +3509,13 @@ static void runBoltAndPack(const std::string &objPath) {
       std::fprintf(stderr, "[Error] Failed to save pre-BOLT backup %s -> %s.\n", objPath.c_str(), preboltBackup.c_str());
       return;
     }
+    const std::string normalized = objPath + ".prebolt.normalized.tmp";
     std::string cmd = q(objcopyBin) + " --remove-section=.riscv.attributes " +
-                      q(objPath) + ' ' + q(objPath) + " > /dev/null 2>&1";
-    if (std::system(cmd.c_str()) != 0) {
-      std::fprintf(stderr, "[Error] Pre-BOLT objcopy (in-place) failed.\n");
+                      q(objPath) + ' ' + q(normalized) + " > /dev/null 2>&1";
+    if (std::system(cmd.c_str()) != 0 ||
+        ::rename(normalized.c_str(), objPath.c_str()) != 0) {
+      std::fprintf(stderr, "[Error] Pre-BOLT objcopy normalization failed.\n");
+      ::unlink(normalized.c_str());
       return;
     }
     struct stat st{};
@@ -3661,6 +3664,17 @@ static void runBoltAndPack(const std::string &objPath) {
         std::fprintf(stderr, "[ERROR] BOLT fast-path failed (no baseline).\n");
         return;
       }
+      const long preboltSize = fileSizeOf(preboltBackup);
+      const long boltSize = fileSizeOf(alignedOnce);
+      if (preboltSize > 0 && (boltSize <= 0 || boltSize >= preboltSize)) {
+        std::printf("[SIZE-GUARD] Rejecting no-baseline BOLT output: "
+                    "prebolt=%ld, bolt=%ld\n", preboltSize, boltSize);
+        ::unlink(rawOnce.c_str());
+        ::unlink(alignedOnce.c_str());
+        if (::rename(preboltBackup.c_str(), objPath.c_str()) != 0)
+          std::perror("rename");
+        return;
+      }
       if (::rename(alignedOnce.c_str(), objPath.c_str()) != 0) {
         std::perror("rename");
       } else {
@@ -3731,10 +3745,22 @@ static void runBoltAndPack(const std::string &objPath) {
       }
     };
     auto addOutputCandidateSet = [&](const std::string &path,
-                                     const std::string &label) {
-      if (addOutputValidatedCandidate(path, label))
+                                     const std::string &label) -> bool {
+      bool accepted = addOutputValidatedCandidate(path, label);
+      if (accepted)
         addPackedOutputValidatedCandidates(path, label);
+      return accepted;
     };
+
+    std::string preboltOriginal;
+    if (copyFileForCandidate(preboltBackup,
+                             objPath + ".prebolt.original.tmp")) {
+      preboltOriginal = objPath + ".prebolt.original.tmp";
+      if (!addOutputCandidateSet(preboltOriginal, "prebolt-original")) {
+        ::unlink(preboltOriginal.c_str());
+        preboltOriginal.clear();
+      }
+    }
 
     std::string rawOnce, alignedOnce;
     if (boltOnce(objPath, rawOnce, alignedOnce)) {
@@ -3957,9 +3983,25 @@ static void runBoltAndPack(const std::string &objPath) {
 
     std::string originalBest;
     std::string originalBestLabel;
-    bool haveOriginal = selectBestPayloadCandidate(
+    bool haveBoltBest = selectBestPayloadCandidate(
         packAligned, objPath, baselineHex, offsetTag,
         /*requireChecksum=*/true, originalBest, originalBestLabel);
+
+    // Keep the original linked image in the same global competition as BOLT.
+    // A packer can shrink a BOLT image while the result is still larger than
+    // the original; choosing only among BOLT-derived candidates is unsafe.
+    std::string preboltBest;
+    std::string preboltBestLabel;
+    bool havePreboltBest = false;
+    const std::string preboltCandidateInput =
+        objPath + ".prebolt.candidate.tmp";
+    if (copyFileForCandidate(preboltBackup, preboltCandidateInput)) {
+      havePreboltBest = selectBestPayloadCandidate(
+          preboltCandidateInput, objPath, baselineHex, "prebolt",
+          /*requireChecksum=*/true, preboltBest, preboltBestLabel);
+      if (!havePreboltBest)
+        ::unlink(preboltCandidateInput.c_str());
+    }
 
     std::string noplizedBest;
     std::string noplizedBestLabel;
@@ -3983,9 +4025,13 @@ static void runBoltAndPack(const std::string &objPath) {
                                    noplizedAggressiveBestLabel);
 
     std::vector<PayloadCandidate> bests;
-    if (haveOriginal)
+    if (haveBoltBest)
       bests.push_back(
           {originalBest, originalBestLabel, fileSizeOf(originalBest)});
+    if (havePreboltBest)
+      bests.push_back(
+          {preboltBest, "prebolt-" + preboltBestLabel,
+           fileSizeOf(preboltBest)});
     if (haveNoplized)
       bests.push_back({noplizedBest, "noplize-" + noplizedBestLabel,
                        fileSizeOf(noplizedBest)});
@@ -4050,6 +4096,16 @@ static void runBoltAndPack(const std::string &objPath) {
 
   (void)attempt(finalToInstall, lastBoltAlignedOut);
   if (!finalToInstall.empty()) {
+    const long preboltSize = fileSizeOf(preboltBackup);
+    const long finalSize = fileSizeOf(finalToInstall);
+    if (preboltSize > 0 && (finalSize <= 0 || finalSize >= preboltSize)) {
+      std::printf("[SIZE-GUARD] Rejecting final candidate: prebolt=%ld, "
+                  "final=%ld\n", preboltSize, finalSize);
+      ::unlink(finalToInstall.c_str());
+      finalToInstall.clear();
+    }
+  }
+  if (!finalToInstall.empty()) {
     if (::rename(finalToInstall.c_str(), objPath.c_str()) != 0) {
       std::perror("rename");
     } else {
@@ -4061,15 +4117,16 @@ static void runBoltAndPack(const std::string &objPath) {
     return;
   }
 
-  if (!lastBoltAlignedOut.empty()) {
-    if (::rename(lastBoltAlignedOut.c_str(), objPath.c_str()) != 0) {
-      std::perror("rename");
-    } else {
-      std::printf("[INFO] Installed un-packed BOLT output as fallback: %s\n", objPath.c_str());
-    }
-  } else {
-    std::fprintf(stderr, "[ERROR] No BOLT output available for fallback.\n");
-  }
+  // Never install an un-packed BOLT image after the candidate pipeline has
+  // failed. The original image is the only safe fallback and also prevents a
+  // layout regression from becoming a size regression.
+  if (!lastBoltAlignedOut.empty())
+    ::unlink(lastBoltAlignedOut.c_str());
+  if (::rename(preboltBackup.c_str(), objPath.c_str()) != 0)
+    std::perror("rename");
+  else
+    std::printf("[INFO] Restored pre-BOLT output after candidate rejection: %s\n",
+                objPath.c_str());
   // preboltPath 保留
 }
 

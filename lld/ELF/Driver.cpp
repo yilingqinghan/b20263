@@ -4095,6 +4095,32 @@ static void runBoltAndPack(const std::string &objPath) {
   std::string lastBoltAlignedOut;
 
   (void)attempt(finalToInstall, lastBoltAlignedOut);
+  if (finalToInstall.empty()) {
+    // BOLT can fail or produce a checksum mismatch for a valid input. Do not
+    // fall back directly to the raw pre-BOLT file: it may still be an
+    // excellent payload for the generic packers.
+    if (!lastBoltAlignedOut.empty()) {
+      ::unlink(lastBoltAlignedOut.c_str());
+      lastBoltAlignedOut.clear();
+    }
+
+    const std::string preboltFallbackInput =
+        objPath + ".prebolt.fallback.tmp";
+    if (copyFileForCandidate(preboltBackup, preboltFallbackInput)) {
+      std::string fallbackPath;
+      std::string fallbackLabel;
+      if (selectBestPayloadCandidate(
+              preboltFallbackInput, objPath, baselineHex,
+              "prebolt-fallback", /*requireChecksum=*/true, fallbackPath,
+              fallbackLabel)) {
+        finalToInstall = fallbackPath;
+        std::printf("[FALLBACK] selected pre-BOLT %s candidate after BOLT "
+                    "failure\n", fallbackLabel.c_str());
+      } else {
+        ::unlink(preboltFallbackInput.c_str());
+      }
+    }
+  }
   if (!finalToInstall.empty()) {
     const long preboltSize = fileSizeOf(preboltBackup);
     const long finalSize = fileSizeOf(finalToInstall);

@@ -4108,6 +4108,9 @@ static void runBoltAndPack(const std::string &objPath) {
         objPath + ".prebolt.fallback.tmp";
     if (copyFileForCandidate(preboltBackup, preboltFallbackInput)) {
       std::string fallbackPath;
+      const std::string noplizeInput =
+          objPath + ".prebolt.fallback.noplize.input.tmp";
+      const bool haveNoplizeInput = copyFileForCandidate(preboltBackup, noplizeInput);
       std::string fallbackLabel;
       if (selectBestPayloadCandidate(
               preboltFallbackInput, objPath, baselineHex,
@@ -4119,7 +4122,38 @@ static void runBoltAndPack(const std::string &objPath) {
       } else {
         ::unlink(preboltFallbackInput.c_str());
       }
-    }
+      if (EnableNoplize && !baselineHex.empty()) {
+        const std::string tracePath =
+            objPath + ".prebolt-fallback.noplize.trace.txt";
+        const std::string noplizeRaw =
+            objPath + ".prebolt-fallback.noplize.tmp";
+        std::string noplizeBest;
+        std::string noplizeLabel;
+        if (haveNoplizeInput && runQemuInAsmTrace(noplizeInput, tracePath) &&
+            makeRiscvNoplizedCandidate(noplizeInput, tracePath,
+                                       noplizeRaw, /*aggressive=*/false) &&
+            selectBestPayloadCandidate(
+                noplizeRaw, objPath, baselineHex,
+                "prebolt-fallback-noplize", /*requireChecksum=*/true,
+                noplizeBest, noplizeLabel)) {
+          if (finalToInstall.empty() ||
+              fileSizeOf(noplizeBest) < fileSizeOf(finalToInstall)) {
+            if (!finalToInstall.empty())
+              ::unlink(finalToInstall.c_str());
+            finalToInstall = noplizeBest;
+            std::printf("[FALLBACK] selected pre-BOLT noplize-%s candidate after BOLT failure%c",
+                        noplizeLabel.c_str(), 10);
+          } else {
+            ::unlink(noplizeBest.c_str());
+          }
+        }
+        ::unlink(tracePath.c_str());
+        if (noplizeBest != noplizeRaw)
+          ::unlink(noplizeRaw.c_str());
+      }
+      if (haveNoplizeInput)
+        ::unlink(noplizeInput.c_str());
+      }
   }
   if (!finalToInstall.empty()) {
     const long preboltSize = fileSizeOf(preboltBackup);

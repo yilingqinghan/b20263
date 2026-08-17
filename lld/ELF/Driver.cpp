@@ -3478,7 +3478,7 @@ static void runBoltAndPack(const std::string &objPath) {
 
   const std::string boltBin    = ToolChain + "/llvm-bolt";
   const std::string objcopyBin = ToolChain + "/llvm-objcopy";
-  constexpr bool EnableNoplize = true;
+  constexpr bool EnableNoplize = false;
 
   // === BASELINE (before any mutation) ===
   std::string baselineHexRaw;

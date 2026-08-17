@@ -95,6 +95,10 @@ private:
   /// from meta data in the file.
   void discoverFileObjects();
 
+  /// Compact libc's errmsgstr/errmsgidx tables after locating them by their
+  /// data symbols. The compact table keeps index-to-message lookup semantics.
+  void compactRodataMessageTable();
+
   /// Create and initialize metadata rewriters for this instance.
   void initializeMetadataManager();
 

@@ -61,7 +61,9 @@
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <cstring>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <system_error>
@@ -1019,7 +1021,8 @@ void RewriteInstance::discoverFileObjects() {
       continue;
     if (Name == "errmsgstr" || Name == "errmsgidx") {
       opts::RodataCutSize.setValue(opts::RodataCutSize + Size);
-      errs() << "→RODATA found errmsg with size:" << opts::RodataCutSize << '\n';
+      errs() << "RODATA found errmsg with size:" << opts::RodataCutSize
+             << '\n';
     }
     Expected<StringRef> NameOrError = Symbol.getName();
     if (NameOrError && NameOrError->startswith("__asan_init")) {
@@ -1536,6 +1539,228 @@ void RewriteInstance::discoverFileObjects() {
   }
 
   registerFragments();
+  compactRodataMessageTable();
+}
+
+void RewriteInstance::compactRodataMessageTable() {
+  if (!opts::MinimizeRodata || !BC->isELF())
+    return;
+
+  ErrorOr<BinarySection &> SectionOrError =
+      BC->getUniqueSectionByName(".rodata");
+  if (!SectionOrError)
+    return;
+
+  BinarySection &Section = SectionOrError.get();
+  StringRef Contents = Section.getContents();
+  if (Contents.size() < 64)
+    return;
+
+  struct TableSymbol {
+    uint64_t Address = 0;
+    uint64_t Size = 0;
+  };
+
+  TableSymbol StringSymbol;
+  TableSymbol IndexSymbol;
+  for (const ELFSymbolRef &Symbol : InputFile->symbols()) {
+    auto SecOrError = Symbol.getSection();
+    if (!SecOrError || *SecOrError == InputFile->section_end())
+      continue;
+    if (cantFail((*SecOrError)->getName()) != ".rodata")
+      continue;
+
+    // These are libc's generic errno string and offset tables. The names are
+    // used only to locate the known ABI data structure, never to select a
+    // benchmark or input file.
+    StringRef Name = cantFail(Symbol.getName());
+    if (Name != "errmsgstr" && Name != "errmsgidx")
+      continue;
+
+    TableSymbol &Table = Name == "errmsgstr" ? StringSymbol : IndexSymbol;
+    Table.Address = cantFail(Symbol.getAddress());
+    Table.Size = Symbol.getSize();
+  }
+  if (!StringSymbol.Size || !IndexSymbol.Size ||
+      IndexSymbol.Address != StringSymbol.Address + StringSymbol.Size ||
+      StringSymbol.Address < Section.getAddress() ||
+      IndexSymbol.Address + IndexSymbol.Size > Section.getEndAddress())
+    return;
+
+  const uint64_t StringOffset = StringSymbol.Address - Section.getAddress();
+  const uint64_t IndexOffset = IndexSymbol.Address - Section.getAddress();
+  const uint64_t OldTableEnd = IndexOffset + IndexSymbol.Size;
+  const uint64_t StringAddress = StringSymbol.Address;
+  const uint64_t IndexAddress = IndexSymbol.Address;
+  BinaryData *StringData = BC->getBinaryDataAtAddress(StringAddress);
+  BinaryData *IndexData = BC->getBinaryDataAtAddress(IndexAddress);
+  if (!StringData || !IndexData || StringData == IndexData)
+    return;
+
+  // Moving a range that has internal relocations would require relocating the
+  // section's relocation offsets as well. Refuse such layouts conservatively.
+  for (const Relocation &Rel : Section.relocations())
+    if (Rel.Offset >= StringOffset)
+      return;
+  for (const Relocation &Rel : Section.dynamicRelocations())
+    if (Rel.Offset >= StringOffset)
+      return;
+
+  std::vector<uint64_t> StringStarts;
+  StringRef StringContents = Contents.substr(StringOffset, StringSymbol.Size);
+  if (StringContents.empty() || StringContents.back() != '\0')
+    return;
+  for (uint64_t Pos = 0; Pos < StringContents.size();) {
+    size_t End = StringContents.find('\0', Pos);
+    if (End == StringRef::npos)
+      return;
+    if (End != Pos) {
+      for (uint64_t I = Pos; I < End; ++I) {
+        const unsigned char C = static_cast<unsigned char>(StringContents[I]);
+        if (C < 0x20 || C > 0x7e)
+          return;
+      }
+      StringStarts.push_back(Pos);
+    }
+    Pos = End + 1;
+  }
+  if (StringStarts.size() < 16 || (IndexSymbol.Size & 1) ||
+      IndexSymbol.Size / 2 < StringStarts.size())
+    return;
+
+  std::set<uint16_t> ValidOffsets;
+  for (uint64_t Start : StringStarts) {
+    if (Start > std::numeric_limits<uint16_t>::max())
+      return;
+    ValidOffsets.insert(static_cast<uint16_t>(Start));
+  }
+  std::vector<uint16_t> IndexValues;
+  StringRef IndexContents = Contents.substr(IndexOffset, IndexSymbol.Size);
+  for (uint64_t I = 0; I < IndexContents.size(); I += 2) {
+    const uint16_t Value = static_cast<uint16_t>(
+        static_cast<unsigned char>(IndexContents[I]) |
+        (static_cast<uint16_t>(static_cast<unsigned char>(IndexContents[I + 1]))
+         << 8));
+    if (!ValidOffsets.count(Value))
+      return;
+    IndexValues.push_back(Value);
+  }
+
+  for (auto Entry : BC->getBinaryDataForSection(Section)) {
+    BinaryData *Data = Entry.second;
+    if (Data == StringData || Data == IndexData || !Data->getSize())
+      continue;
+
+    const uint64_t Begin = Data->getAddress() - Section.getAddress();
+    const uint64_t End = Begin + Data->getSize();
+    if ((Begin < IndexOffset && End > StringOffset) ||
+        (Begin < OldTableEnd && End > OldTableEnd))
+      return;
+  }
+
+  auto makeShortMessage = [](StringRef Message) {
+    std::string Code;
+    bool AtWordStart = true;
+    for (unsigned char C : Message) {
+      const bool IsAlpha =
+          (C >= 'a' && C <= 'z') || (C >= 'A' && C <= 'Z');
+      if (!IsAlpha) {
+        AtWordStart = true;
+        continue;
+      }
+      if (AtWordStart) {
+        Code.push_back(C >= 'a' && C <= 'z' ? C - ('a' - 'A') : C);
+        AtWordStart = false;
+      }
+    }
+    if (Code.empty())
+      Code = "E";
+    while (Code.size() < 3)
+      Code.push_back('X');
+    if (Code.size() > 3)
+      Code.resize(3);
+    return Code;
+  };
+
+  std::set<std::string> UsedCodes;
+  unsigned CollisionId = 0;
+  std::map<uint64_t, uint16_t> NewOffsets;
+  std::string CompactStrings;
+  for (uint64_t Start : StringStarts) {
+    const uint64_t AbsoluteEnd = Contents.find('\0', StringOffset + Start);
+    if (AbsoluteEnd == StringRef::npos)
+      return;
+
+    std::string Code = makeShortMessage(
+        Contents.slice(StringOffset + Start,
+                       AbsoluteEnd - (StringOffset + Start)));
+    while (!UsedCodes.insert(Code).second) {
+      unsigned Value = CollisionId++;
+      Code.assign(3, 'A');
+      for (int I = 2; I >= 0; --I) {
+        Code[I] = static_cast<char>('A' + (Value % 26));
+        Value /= 26;
+      }
+    }
+
+    if (CompactStrings.size() > std::numeric_limits<uint16_t>::max())
+      return;
+    NewOffsets[Start] = static_cast<uint16_t>(CompactStrings.size());
+    CompactStrings.append(Code);
+    CompactStrings.push_back('\0');
+  }
+
+  if (CompactStrings.size() >= StringSymbol.Size)
+    return;
+
+  const uint64_t Freed = StringSymbol.Size - CompactStrings.size();
+  const uint64_t NewIndexOffset = StringOffset + CompactStrings.size();
+  const uint64_t NewSuffixOffset = OldTableEnd - Freed;
+  if (NewIndexOffset + IndexSymbol.Size != NewSuffixOffset ||
+      NewSuffixOffset > Contents.size())
+    return;
+
+  std::vector<uint8_t> NewContents(Contents.size());
+  std::memcpy(NewContents.data(), Contents.data(), Contents.size());
+  std::vector<uint8_t> NewIndex(IndexSymbol.Size);
+  std::memcpy(NewIndex.data(), Contents.data() + IndexOffset,
+              IndexSymbol.Size);
+  for (uint64_t I = 0; I < IndexValues.size(); ++I) {
+    auto It = NewOffsets.find(IndexValues[I]);
+    if (It == NewOffsets.end())
+      return;
+    NewIndex[I * 2] = static_cast<uint8_t>(It->second);
+    NewIndex[I * 2 + 1] = static_cast<uint8_t>(It->second >> 8);
+  }
+
+  std::fill(NewContents.begin() + StringOffset, NewContents.end(), 0);
+  std::memcpy(NewContents.data() + StringOffset, CompactStrings.data(),
+              CompactStrings.size());
+  std::memcpy(NewContents.data() + NewIndexOffset, NewIndex.data(),
+              NewIndex.size());
+  std::memcpy(NewContents.data() + NewSuffixOffset,
+              Contents.data() + OldTableEnd, Contents.size() - OldTableEnd);
+
+  StringData->setOutputLocation(Section, StringOffset);
+  IndexData->setOutputLocation(Section, NewIndexOffset);
+
+  for (auto Entry : BC->getBinaryDataForSection(Section)) {
+    BinaryData *Data = Entry.second;
+    if (Data == StringData || Data == IndexData ||
+        Data->getAddress() < Section.getAddress() + OldTableEnd)
+      continue;
+    Data->setOutputLocation(
+        Section, Data->getAddress() - Section.getAddress() - Freed);
+  }
+
+  Section.updateContents(copyByteArray(NewContents.data(), NewContents.size()),
+                         NewContents.size());
+  // The early symbol trigger is needed by the old-text layout. Replace its
+  // provisional whole-table size with the bytes actually removed.
+  opts::RodataCutSize.setValue(opts::RodataCutSize - StringSymbol.Size -
+                               IndexSymbol.Size + Freed);
+  errs() << "BOLT-INFO: compacted structured rodata table by " << Freed
+         << " bytes (" << StringStarts.size() << " entries)\n";
 }
 
 void RewriteInstance::registerFragments() {

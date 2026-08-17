@@ -66,15 +66,27 @@ with open(orig_path, "rb") as f:
 
 MAGIC = 0x52565058
 hdr = struct.pack("<III", MAGIC, entry, len(loads))
+payload_parts = []
+payload_offset = 0
+orig_bytes = pathlib.Path(orig_path).read_bytes()
 for seg in loads:
+    file_offset = seg["p_offset"]
+    file_size = seg["p_filesz"]
+    segment_data = orig_bytes[file_offset:file_offset + file_size]
+    if len(segment_data) != file_size:
+        sys.exit("PT_LOAD extends past end of input")
     hdr += struct.pack(
         "<IIIIII",
         seg["p_vaddr"], seg["p_filesz"], seg["p_memsz"],
-        seg["p_flags"], seg["p_align"], seg["p_offset"]
+        seg["p_flags"], seg["p_align"], payload_offset
     )
+    payload_parts.append(segment_data)
+    payload_offset += file_size
 
-orig_bytes = pathlib.Path(orig_path).read_bytes()
-payload = compress_payload(orig_bytes)
+# The loader only copies PT_LOAD file contents into the mapped image. Keeping
+# ELF section headers, relocation sections, and padding in the compressed blob
+# wastes space without affecting execution.
+payload = compress_payload(b"".join(payload_parts))
 
 marker = b"\xDE\xAD\xBE\xEF"
 marker_pos = stub_data.find(marker)

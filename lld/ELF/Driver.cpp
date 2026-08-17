@@ -3478,28 +3478,27 @@ static void runBoltAndPack(const std::string &objPath) {
 
   const std::string boltBin    = ToolChain + "/llvm-bolt";
   const std::string objcopyBin = ToolChain + "/llvm-objcopy";
-  const std::string runtimeTrace = objPath + ".runtime.trace.txt";
+  constexpr bool EnableNoplize = false;
 
   // === BASELINE (before any mutation) ===
   std::string baselineHexRaw;
   QemuRunResult tracedBaseline;
   bool tracedBaselineRan =
       runQemuCaptureCtx(objPath, "BASELINE-TRACE", "-", tracedBaseline,
-                        /*dumpOutput=*/false, runtimeTrace);
+                        /*dumpOutput=*/false);
   bool haveRunnableBaseline = tracedBaselineRan && tracedBaseline.exitCode == 0;
   bool haveRaw = haveRunnableBaseline && tracedBaseline.hasChecksum;
   if (haveRaw) {
     baselineHexRaw = tracedBaseline.checksum;
     std::printf("[CHECKSUM-BASELINE-RAW] %s\n", baselineHexRaw.c_str());
   } else if (!haveRunnableBaseline) {
-    ::unlink(runtimeTrace.c_str());
     haveRaw = runQemuAndGetChecksumCtx(objPath, "BASELINE-RAW", "-",
                                        baselineHexRaw);
     if (haveRaw)
       std::printf("[CHECKSUM-BASELINE-RAW] %s\n", baselineHexRaw.c_str());
   } else {
-    std::printf("[INFO] Baseline has no checksum; keeping runtime trace and "
-                "using full-output validation.\n");
+    std::printf("[INFO] Baseline has no checksum; using full-output "
+                "validation.\n");
   }
 
   // 0) Save a pre-BOLT backup, then mutate objPath in-place to remove .riscv.attributes (match DIRECT path)
@@ -3543,8 +3542,6 @@ static void runBoltAndPack(const std::string &objPath) {
                           " --remove-symtab"
                           " --mini-rodata"
                           " --use-gnu-stack";
-    if (fileSizeOf(runtimeTrace) > 0)
-      boltCmd += " --riscv-elim-runtime-trace=" + q(runtimeTrace);
     std::printf("[BOLT-CMD input=%s] %s\n", input.c_str(), boltCmd.c_str());
     boltCmd += " > " + logFile + " 2>&1";
     if (std::system(boltCmd.c_str()) != 0)
@@ -3751,19 +3748,23 @@ static void runBoltAndPack(const std::string &objPath) {
     if (!preAligned.empty() || alignStripOnly(objPath, preAligned))
       addOutputCandidateSet(preAligned, "prebolt-strip");
 
-    const std::string noplizeTrace = objPath + ".noplize.trace.txt";
-    const std::string preNoplized = objPath + ".prebolt.noplize.tmp";
-    const std::string preNoplizedAggressive =
-        objPath + ".prebolt.noplize.aggressive.tmp";
-    if (runQemuInAsmTrace(objPath, noplizeTrace)) {
-      if (makeRiscvNoplizedCandidate(objPath, noplizeTrace, preNoplized,
-                                     /*aggressive=*/false))
-        addOutputCandidateSet(preNoplized, "prebolt-noplize");
-      if (makeRiscvNoplizedCandidate(objPath, noplizeTrace,
-                                     preNoplizedAggressive,
-                                     /*aggressive=*/true))
-        addOutputCandidateSet(preNoplizedAggressive,
-                              "prebolt-noplize-aggressive");
+    std::string noplizeTrace;
+    std::string preNoplized;
+    std::string preNoplizedAggressive;
+    if (EnableNoplize) {
+      noplizeTrace = objPath + ".noplize.trace.txt";
+      preNoplized = objPath + ".prebolt.noplize.tmp";
+      preNoplizedAggressive = objPath + ".prebolt.noplize.aggressive.tmp";
+      if (runQemuInAsmTrace(objPath, noplizeTrace)) {
+        if (makeRiscvNoplizedCandidate(objPath, noplizeTrace, preNoplized,
+                                       /*aggressive=*/false))
+          addOutputCandidateSet(preNoplized, "prebolt-noplize");
+        if (makeRiscvNoplizedCandidate(objPath, noplizeTrace,
+                                       preNoplizedAggressive,
+                                       /*aggressive=*/true))
+          addOutputCandidateSet(preNoplizedAggressive,
+                                "prebolt-noplize-aggressive");
+      }
     }
 
     std::string preStripped;
@@ -3906,7 +3907,7 @@ static void runBoltAndPack(const std::string &objPath) {
     std::string noplizedAggressiveRaw;
     std::string noplizedAggressivePackAligned;
     std::string noplizeTrace;
-    {
+    if (EnableNoplize) {
       noplizeTrace = objPath + ".pack.noplize." + sanitizePathTag(offsetTag) +
                      ".trace.txt";
 

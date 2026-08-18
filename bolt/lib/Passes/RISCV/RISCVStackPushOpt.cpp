@@ -44,7 +44,15 @@ void RISCVStackPushOpt::runOnFunction(BinaryFunction &BF) {
         if ((curr_offset & ~0x3) != AlignedBase) break;
 
         // 记录偏移特征
-        const int offset_mod = curr_offset % 4;
+        // C++ remainder keeps the sign of the dividend. Stack slots are
+        // commonly addressed with negative offsets, so `% 4` can produce a
+        // negative bitset index and abort BOLT. Compute the byte offset
+        // relative to the aligned block instead; this is always in [0, 3]
+        // after the block check above.
+        const int64_t offset_in_block = curr_offset - AlignedBase;
+        if (offset_in_block < 0 || offset_in_block >= 4)
+          break;
+        const unsigned offset_mod = static_cast<unsigned>(offset_in_block);
         if (!offset_mask.test(offset_mod)) {
           offset_mask.set(offset_mod);
           candidates.push_back(Scan);

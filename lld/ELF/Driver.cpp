@@ -3258,9 +3258,7 @@ static bool packWithLegacyPacker(const std::string &payloadPath) {
   const std::string strip = ToolChain + "/llvm-strip";
   const std::string objcopy = ToolChain + "/llvm-objcopy";
 
-  const std::string bundledPy = PackerDir + "/cpython/bin/python3.8";
-  const std::string py =
-      ::access(bundledPy.c_str(), X_OK) == 0 ? bundledPy : "python3";
+  const std::string py = "python3";
 
   const std::string ld = PackerDir + "/src/linker.ld";
   const std::string loaderLd = PackerDir + "/src/linkerhigh.ld";

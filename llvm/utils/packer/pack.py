@@ -112,7 +112,7 @@ def generate_c_file(bin_path, c_path, symbol):
     with open(c_path, "w") as f:
         f.write('#include <stddef.h>\n')
         f.write(f'__attribute__((used, aligned(1), visibility("default"))) '
-                f'unsigned char {symbol_base}_start[] = {{\n')
+                f'const unsigned char {symbol_base}_start[] = {{\n')
         for i, b in enumerate(data):
             if i % 12 == 0:
                 f.write("  ")

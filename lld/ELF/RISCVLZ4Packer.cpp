@@ -145,27 +145,13 @@ bool lld::elf::packWithLZ4(llvm::StringRef pathRef) {
   }
 
   uint32_t loadStart = loads.front()->p_vaddr;
-  uint32_t loadEnd = loadStart + loads.front()->p_memsz;
-  uint32_t fileEnd = loadStart + loads.front()->p_filesz;
-  for (const Elf32_Phdr *ph : loads) {
-    loadStart = std::min(loadStart, ph->p_vaddr);
-    loadEnd = std::max(loadEnd, ph->p_vaddr + ph->p_memsz);
-    fileEnd = std::max(fileEnd, ph->p_vaddr + ph->p_filesz);
-  }
+  uint32_t loadEnd = loads.back()->p_vaddr + loads.back()->p_memsz;
   if (loadEnd <= loadStart) {
     std::fprintf(stderr, "[LZ4] invalid PT_LOAD address range: %s\n",
                  path.c_str());
     return false;
   }
-  // Anonymous mmap pages are zero-filled. Keep trailing BSS out of the
-  // compressed stream when the loader's 64 KiB mapping round-up still covers
-  // the complete memory image; internal gaps remain represented normally.
-  const uint32_t memImageSize = loadEnd - loadStart;
-  const uint32_t fileImageSize = fileEnd - loadStart;
-  uint32_t imageSize = fileImageSize;
-  const uint32_t roundedMap = (fileImageSize + 0x10000u) & ~0xffffu;
-  if (roundedMap < memImageSize)
-    imageSize = memImageSize;
+  uint32_t imageSize = loadEnd - loadStart;
   std::vector<char> image(imageSize, 0);
   for (const Elf32_Phdr *ph : loads) {
     if (ph->p_vaddr < loadStart ||

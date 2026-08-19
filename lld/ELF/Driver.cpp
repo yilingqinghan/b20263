@@ -3165,15 +3165,20 @@ static bool selectBestPayloadCandidate(const std::string &inputPath,
                 inputSize);
   }
 
-  const std::string lz4Path = prefix + ".lz4.tmp";
-  if (copyFileForCandidate(inputPath, lz4Path)) {
-    bool accepted = false;
-    if (packWithLZ4(lz4Path))
-      accepted = addVerifiedPayloadCandidate(candidates, lz4Path, "lz4",
-                                             baselineHex, offsetLbl,
-                                             requireChecksum);
-    if (!accepted)
-      ::unlink(lz4Path.c_str());
+  if (inputSize > 50000) {
+    const std::string lz4Path = prefix + ".lz4.tmp";
+    if (copyFileForCandidate(inputPath, lz4Path)) {
+      bool accepted = false;
+      if (packWithLZ4(lz4Path))
+        accepted = addVerifiedPayloadCandidate(candidates, lz4Path, "lz4",
+                                               baselineHex, offsetLbl,
+                                               requireChecksum);
+      if (!accepted)
+        ::unlink(lz4Path.c_str());
+    }
+  } else {
+    std::printf("[CANDIDATE] skip LZ4 for small input size=%ld\n",
+                inputSize);
   }
 
   if (candidates.empty()) {
@@ -3193,7 +3198,7 @@ static bool selectBestPayloadCandidate(const std::string &inputPath,
               bestLabel.c_str(), best->size, bestPath.c_str());
 
   for (const PayloadCandidate &cand : candidates)
-    if (cand.path != bestPath)
+    if (cand.path != bestPath && cand.path != inputPath)
       ::unlink(cand.path.c_str());
   return true;
 }
@@ -3205,26 +3210,14 @@ static void runBoltAndPack(const std::string &objPath) {
   const std::string objcopyBin = ToolChain + "/llvm-objcopy";
   constexpr bool EnableNoplize = false;
 
-  // === BASELINE (before any mutation) ===
+  // Do not execute the input through QEMU here.  The linker must not use a
+  // test-input execution as an oracle before selecting generic candidates.
+  // Candidate selection below is therefore size-only when no baseline is
+  // available; the pre-BOLT image remains the correctness-preserving fallback.
   std::string baselineHexRaw;
   QemuRunResult tracedBaseline;
-  bool tracedBaselineRan =
-      runQemuCaptureCtx(objPath, "BASELINE-TRACE", "-", tracedBaseline,
-                        /*dumpOutput=*/false);
-  bool haveRunnableBaseline = tracedBaselineRan && tracedBaseline.exitCode == 0;
-  bool haveRaw = haveRunnableBaseline && tracedBaseline.hasChecksum;
-  if (haveRaw) {
-    baselineHexRaw = tracedBaseline.checksum;
-    std::printf("[CHECKSUM-BASELINE-RAW] %s\n", baselineHexRaw.c_str());
-  } else if (!haveRunnableBaseline) {
-    haveRaw = runQemuAndGetChecksumCtx(objPath, "BASELINE-RAW", "-",
-                                       baselineHexRaw);
-    if (haveRaw)
-      std::printf("[CHECKSUM-BASELINE-RAW] %s\n", baselineHexRaw.c_str());
-  } else {
-    std::printf("[INFO] Baseline has no checksum; using full-output "
-                "validation.\n");
-  }
+  const bool haveRunnableBaseline = false;
+  const bool haveRaw = false;
 
   // 0) Save a pre-BOLT backup, then mutate objPath in-place to remove .riscv.attributes (match DIRECT path)
   const std::string preboltBackup = objPath + ".prebolt";
@@ -3341,30 +3334,14 @@ static void runBoltAndPack(const std::string &objPath) {
     return true;
   };
 
-  // 2) 基线：优先使用“原始输出(未改动)”；否则回退到就地删段后的/对齐后的
+  // 2) No execution baseline is collected.  Keep the old normalization helpers
+  // available for the checksum-enabled path, but use the pre-BOLT backup as the
+  // size reference for the normal path below.
   std::string baselineHexPre, baselineHexAligned, baselineHex;
   std::string preAligned;
 
-  bool havePre = false;
-  bool haveAligned = false;
-  if (haveRunnableBaseline && !haveRaw) {
-    (void)alignStripOnly(objPath, preAligned);
-  } else {
-    havePre =
-        runQemuAndGetChecksumCtx(objPath, "BASELINE-PREBOLT", "-",
-                                 baselineHexPre);
-    if (havePre)
-      std::printf("[CHECKSUM-BASELINE-PREBOLT] %s\n",
-                  baselineHexPre.c_str());
-
-    haveAligned =
-        alignStripOnly(objPath, preAligned) &&
-        runQemuAndGetChecksumCtx(preAligned, "BASELINE-ALIGNED", "-",
-                                 baselineHexAligned);
-    if (haveAligned)
-      std::printf("[CHECKSUM-BASELINE-ALIGNED] %s\n",
-                  baselineHexAligned.c_str());
-  }
+  const bool havePre = false;
+  const bool haveAligned = false;
 
   bool haveBaseline = false;
   if (haveRaw) {
@@ -3382,30 +3359,76 @@ static void runBoltAndPack(const std::string &objPath) {
 
   if (!haveBaseline) {
     if (!haveRunnableBaseline) {
-      std::printf("[INFO] No runnable baseline available. Do single BOLT "
-                  "(no pack) and finish.\n");
+      std::printf("[INFO] No execution baseline; compare BOLT and pre-BOLT "
+                  "payload candidates by size.\n");
       std::string rawOnce, alignedOnce;
       if (!boltOnce(objPath, rawOnce, alignedOnce)) {
         std::fprintf(stderr, "[ERROR] BOLT fast-path failed (no baseline).\n");
+        if (!copyFileForCandidate(preboltBackup, objPath))
+          std::fprintf(stderr, "[ERROR] Failed to restore pre-BOLT image.\n");
         return;
       }
+
+      std::vector<PayloadCandidate> candidates;
+      auto addSizeCandidates = [&](const std::string &input,
+                                   const char *source) {
+        std::string bestPath;
+        std::string bestLabel;
+        const std::string tag = std::string("no-oracle-") + source;
+        if (selectBestPayloadCandidate(input, objPath, "", tag,
+                                       /*requireChecksum=*/false, bestPath,
+                                       bestLabel))
+          candidates.push_back({bestPath, std::string(source) + "-" + bestLabel,
+                                fileSizeOf(bestPath)});
+      };
+
+      // Let BOLT-derived and pre-BOLT payloads compete on size.  The latter
+      // remains available as the generic fallback when BOLT grows the image.
+      addSizeCandidates(alignedOnce, "bolt");
+      addSizeCandidates(preboltBackup, "prebolt");
+
       const long preboltSize = fileSizeOf(preboltBackup);
-      const long boltSize = fileSizeOf(alignedOnce);
-      if (preboltSize > 0 && (boltSize <= 0 || boltSize >= preboltSize)) {
-        std::printf("[SIZE-GUARD] Rejecting no-baseline BOLT output: "
-                    "prebolt=%ld, bolt=%ld\n", preboltSize, boltSize);
+      auto best = candidates.end();
+      if (!candidates.empty())
+        best = std::min_element(
+            candidates.begin(), candidates.end(),
+            [](const PayloadCandidate &a, const PayloadCandidate &b) {
+              return a.size < b.size;
+            });
+
+      if (best == candidates.end() || preboltSize <= 0 ||
+          best->size <= 0 || best->size >= preboltSize) {
+        std::printf("[SIZE-GUARD] Keeping pre-BOLT image: prebolt=%ld, "
+                    "candidate=%ld\n",
+                    preboltSize, best == candidates.end() ? -1 : best->size);
+        for (const PayloadCandidate &candidate : candidates)
+          if (candidate.path != preboltBackup)
+            ::unlink(candidate.path.c_str());
         ::unlink(rawOnce.c_str());
         ::unlink(alignedOnce.c_str());
-        if (::rename(preboltBackup.c_str(), objPath.c_str()) != 0)
-          std::perror("rename");
+        if (!copyFileForCandidate(preboltBackup, objPath))
+          std::fprintf(stderr, "[ERROR] Failed to restore pre-BOLT image.\n");
         return;
       }
-      if (::rename(alignedOnce.c_str(), objPath.c_str()) != 0) {
-        std::perror("rename");
-      } else {
-        std::printf("[INFO] Installed BOLT output (no pack) atomically: %s\n",
+
+      const std::string selected = best->path;
+      std::printf("[SIZE-ONLY] selected %s size=%ld, prebolt=%ld\n",
+                  best->label.c_str(), best->size, preboltSize);
+      for (const PayloadCandidate &candidate : candidates)
+        if (candidate.path != selected)
+          ::unlink(candidate.path.c_str());
+      if (rawOnce != selected)
+        ::unlink(rawOnce.c_str());
+      if (alignedOnce != selected)
+        ::unlink(alignedOnce.c_str());
+      if (copyFileForCandidate(selected, objPath))
+        std::printf("[INFO] Installed size-selected candidate: %s\n",
                     objPath.c_str());
-      }
+      else
+        std::fprintf(stderr, "[ERROR] Failed to install size-selected candidate: %s\n",
+                     selected.c_str());
+      if (selected != preboltBackup)
+        ::unlink(selected.c_str());
       return;
     }
 

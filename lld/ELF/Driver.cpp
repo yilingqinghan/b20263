@@ -3261,7 +3261,7 @@ static void runBoltAndPack(const std::string &objPath) {
                           " -o " + q(rawFile) +
                           " --ignore-build-id"
                           " --remove-symtab"
-                          " --mini-rodata"
+                          " --mini-rodata=false"
                           " --use-gnu-stack";
     std::printf("[BOLT-CMD input=%s] %s\n", input.c_str(), boltCmd.c_str());
     boltCmd += " > " + logFile + " 2>&1";

@@ -8,8 +8,6 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/Support/CommandLine.h"
-#include "llvm/Support/LineIterator.h"
-#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
@@ -18,23 +16,6 @@ namespace llvm {
 namespace bolt {
 
 namespace opts {
-static cl::opt<std::string> RISCVElimRuntimeTrace(
-    "riscv-elim-runtime-trace",
-    cl::desc("qemu -d exec trace used to remove functions not executed by the "
-             "current benchmark run"),
-    cl::Hidden, cl::init(""));
-
-static cl::opt<bool> RISCVElimUseOldTextOnly(
-    "riscv-elim-use-old-text-only",
-    cl::desc("let eligible functions keep executing from the original .text "
-             "instead of being re-emitted by BOLT"),
-    cl::Hidden, cl::init(false));
-
-static cl::opt<unsigned> RISCVElimUseOldTextMaxTraceCount(
-    "riscv-elim-use-old-text-max-trace-count",
-    cl::desc("with -riscv-elim-use-old-text-only, keep re-emitting functions "
-             "with more trace hits than this threshold"),
-    cl::Hidden, cl::init(0));
 } // namespace opts
 
 namespace {
@@ -42,14 +23,6 @@ namespace {
 using FunctionSet = SmallPtrSet<BinaryFunction *, 16>;
 using EdgeMap = DenseMap<BinaryFunction *, SmallVector<BinaryFunction *, 4>>;
 using AliasMap = DenseMap<BinaryFunction *, BinaryFunction *>;
-using TraceCountMap = DenseMap<BinaryFunction *, uint64_t>;
-
-struct RuntimeTraceInfo {
-  FunctionSet Executed;
-  TraceCountMap Counts;
-  uint64_t NumAddresses = 0;
-};
-
 bool isRISCVDirectControlRelocation(uint64_t Type) {
   switch (Type) {
   case ELF::R_RISCV_CALL:
@@ -268,77 +241,6 @@ void clearFunctionBody(BinaryFunction &BF) {
     BB.clear();
 }
 
-bool parseHexAddress(StringRef Hex, uint64_t &Address) {
-  Hex = Hex.trim();
-  Hex.consume_front("0x");
-  Hex.consume_front("0X");
-  if (Hex.empty() || Hex.size() > 16)
-    return false;
-  return !Hex.getAsInteger(16, Address);
-}
-
-void markTraceAddress(BinaryContext &BC, uint64_t Address,
-                      const AliasMap &Aliases, RuntimeTraceInfo &Trace) {
-  BinaryFunction *BF = BC.getBinaryFunctionContainingAddress(
-      Address, /*CheckPastEnd=*/false, /*UseMaxSize=*/true);
-  if (!BF)
-    return;
-  if (BinaryFunction *Canonical = canonicalize(BF, Aliases)) {
-    Trace.Executed.insert(Canonical);
-    ++Trace.Counts[Canonical];
-  }
-}
-
-RuntimeTraceInfo loadRuntimeTrace(BinaryContext &BC, const AliasMap &Aliases) {
-  RuntimeTraceInfo Trace;
-  if (opts::RISCVElimRuntimeTrace.empty())
-    return Trace;
-
-  ErrorOr<std::unique_ptr<MemoryBuffer>> BufferOrErr =
-      MemoryBuffer::getFile(opts::RISCVElimRuntimeTrace);
-  if (!BufferOrErr) {
-    errs() << "BOLT-WARNING: cannot read RISC-V runtime trace "
-           << opts::RISCVElimRuntimeTrace << ": "
-           << BufferOrErr.getError().message() << "\n";
-    return Trace;
-  }
-
-  std::unique_ptr<MemoryBuffer> Buffer = std::move(*BufferOrErr);
-  SmallVector<StringRef, 4> Parts;
-
-  for (StringRef Line : llvm::make_range(line_iterator(*Buffer, false),
-                                         line_iterator())) {
-    size_t Pos = 0;
-    while ((Pos = Line.find('[', Pos)) != StringRef::npos) {
-      const size_t End = Line.find(']', Pos + 1);
-      if (End == StringRef::npos)
-        break;
-
-      StringRef Token = Line.slice(Pos + 1, End);
-      uint64_t Address = 0;
-      if (Token.contains('/')) {
-        Parts.clear();
-        Token.split(Parts, '/');
-        if (Parts.size() >= 2 && parseHexAddress(Parts[1], Address)) {
-          markTraceAddress(BC, Address, Aliases, Trace);
-          ++Trace.NumAddresses;
-        }
-      } else if (parseHexAddress(Token, Address)) {
-        markTraceAddress(BC, Address, Aliases, Trace);
-        ++Trace.NumAddresses;
-      }
-
-      Pos = End + 1;
-    }
-  }
-
-  outs() << "BOLT-INFO: riscv-elim-unused-funcs loaded "
-         << Trace.Executed.size() << " executed functions from "
-         << Trace.NumAddresses
-         << " trace addresses\n";
-  return Trace;
-}
-
 } // namespace
 
 void RISCVElimUnusedFuncs::runOnFunctions(BinaryContext &BC) {
@@ -348,11 +250,6 @@ void RISCVElimUnusedFuncs::runOnFunctions(BinaryContext &BC) {
   FunctionSet Protected;
   FunctionSet Live;
   SmallVector<BinaryFunction *, 32> Worklist;
-  RuntimeTraceInfo Trace = loadRuntimeTrace(BC, Aliases);
-  const bool UseRuntimeTrace = !Trace.Executed.empty();
-  const bool UseOldTextOnly =
-      UseRuntimeTrace && opts::RISCVElimUseOldTextOnly;
-
   auto addRoot = [&](BinaryFunction *BF, bool Protect = false) {
     if (!BF)
       return;
@@ -379,26 +276,12 @@ void RISCVElimUnusedFuncs::runOnFunctions(BinaryContext &BC) {
 
   for (auto &Entry : BC.getBinaryFunctions()) {
     BinaryFunction &BF = Entry.second;
-    if (UseRuntimeTrace && !canClearBody(BF, /*RequireExternalRefRelocs=*/false))
-      Protected.insert(&BF);
-    else if (!UseRuntimeTrace && isConservativeRoot(BF))
+    if (isConservativeRoot(BF))
       addRoot(&BF, /*Protect=*/true);
   }
 
-  if (UseRuntimeTrace) {
-    if (UseOldTextOnly) {
-      for (auto &Entry : Trace.Counts) {
-        if (Entry.second > opts::RISCVElimUseOldTextMaxTraceCount)
-          Roots.insert(Entry.first);
-      }
-    } else {
-      for (BinaryFunction *BF : Trace.Executed)
-        Roots.insert(BF);
-    }
-  } else {
-    collectInstructionEdges(BC, Edges, Aliases);
-    collectRelocationEdgesAndRoots(BC, Edges, Roots, Protected, Aliases);
-  }
+  collectInstructionEdges(BC, Edges, Aliases);
+  collectRelocationEdgesAndRoots(BC, Edges, Roots, Protected, Aliases);
 
   auto markLive = [&](BinaryFunction *BF) {
     if (!BF || !Live.insert(BF).second)
@@ -426,7 +309,7 @@ void RISCVElimUnusedFuncs::runOnFunctions(BinaryContext &BC) {
 
   for (auto &Entry : BC.getBinaryFunctions()) {
     BinaryFunction &BF = Entry.second;
-    if (!canClearBody(BF, /*RequireExternalRefRelocs=*/!UseRuntimeTrace))
+    if (!canClearBody(BF, /*RequireExternalRefRelocs=*/true))
       continue;
 
     const bool IsAlias = Aliases.contains(&BF);
@@ -448,12 +331,6 @@ void RISCVElimUnusedFuncs::runOnFunctions(BinaryContext &BC) {
            << NumAliasCleared << " overlapping aliases and "
            << NumUnreachableCleared << " unreachable functions (input bytes "
            << BytesCleared << ")"
-           << (UseOldTextOnly ? " using original .text only"
-                              : (UseRuntimeTrace ? " using runtime trace" : ""))
-           << (UseOldTextOnly ? Twine(" (max trace count ") +
-                                     Twine(opts::RISCVElimUseOldTextMaxTraceCount) +
-                                     Twine(")")
-                               : Twine(""))
            << "\n";
   }
 }
